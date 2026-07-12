@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.bcosgrove.Lalia</string>
+<key>CFBundleExecutable</key><string>Lalia</string>
+<key>CFBundleName</key><string>Lalia</string>
+<key>LSUIElement</key><true/>
+<key>LSMinimumSystemVersion</key><string>26.0</string>
+<key>NSMicrophoneUsageDescription</key><string>Lalia records dictation from your microphone.</string>
+<key>NSSpeechRecognitionUsageDescription</key><string>Lalia transcribes your dictation locally.</string>
+</dict></plist>
