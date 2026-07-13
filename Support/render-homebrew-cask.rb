@@ -16,7 +16,7 @@ File.write(output, <<~CASK)
 
     url "https://github.com/cosgroveb/lalia/releases/download/v\#{version}/Lalia-\#{version}.dmg"
     name "Lalia"
-    desc "Native macOS menu-bar voice dictation"
+    desc "Menu-bar voice dictation"
     homepage "https://github.com/cosgroveb/lalia"
 
     livecheck do
@@ -25,7 +25,7 @@ File.write(output, <<~CASK)
     end
 
     depends_on arch: :arm64
-    depends_on macos: ">= :tahoe"
+    depends_on macos: :tahoe
 
     app "Lalia.app"
   end

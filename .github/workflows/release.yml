@@ -19,7 +19,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     env:
       DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
-      LALIA_CODESIGN_IDENTITY: "Developer ID Application: Brian Cosgrove (MS4LQDJJ62)"
+      DEVELOPER_IDENTITY: "Developer ID Application: Brian Cosgrove (MS4LQDJJ62)"
     steps:
       - name: Check out Lalia
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -79,14 +79,14 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
             -k "$keychain_password" "$keychain"
           security list-keychains -d user -s "$keychain"
-          security find-identity -v -p codesigning "$keychain" | rg -F "$LALIA_CODESIGN_IDENTITY"
+          security find-identity -v -p codesigning "$keychain" | rg -F "$DEVELOPER_IDENTITY"
 
       - name: Build Developer ID disk image
         id: package
         run: |
           set -euo pipefail
           version=${{ steps.version.outputs.version }}
-          Support/build-dmg.sh "$version"
+          LALIA_CODESIGN_IDENTITY="$DEVELOPER_IDENTITY" Support/build-dmg.sh "$version"
           dmg="$GITHUB_WORKSPACE/dist/Lalia-$version.dmg"
           codesign --verify --verbose=4 dist/Lalia.app
           codesign --verify --verbose=4 "$dmg"
@@ -219,6 +219,7 @@ jobs:
         run: |
           set -euo pipefail
           brew tap cosgroveb/tap "file://$GITHUB_WORKSPACE/homebrew-tap"
+          brew trust --cask cosgroveb/tap/lalia
           brew style --cask cosgroveb/tap/lalia
           brew audit --cask --strict --online cosgroveb/tap/lalia
           brew livecheck --cask cosgroveb/tap/lalia
