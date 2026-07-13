@@ -1,23 +1,52 @@
 # Lalia
 
-Native macOS 26 menu-bar voice dictation. Hold Command+Shift+D, speak, then
-release to paste a local Speech transcript into the focused app.
+Native macOS menu-bar voice dictation. Hold Command+Shift+D, speak, then
+release to paste an on-device Speech transcript into the focused app.
 
-Build and launch only through the bundled app path:
+Requires Apple silicon, macOS 26 or newer, and microphone, Speech Recognition,
+and Accessibility permission.
+
+## Install
+
+```sh
+brew install --cask cosgroveb/tap/lalia
+open -a Lalia
+```
+
+Open the menu-bar item and choose `Enable Dictation` on first launch. macOS
+prompts for the three required permissions and downloads compatible Speech
+assets when needed.
+
+## Use
+
+Focus a text field, hold Command+Shift+D, speak, and release. Lalia records
+while the shortcut is held, transcribes after release, and pastes one result.
+
+`Copy Last Transcript` remains available from the menu-bar item when paste
+injection fails. Clipboard restoration covers eagerly readable pasteboard
+data; macOS does not expose every lazy or promised representation.
+
+Lalia has no backend, account, history, settings screen, microphone chooser,
+or configurable shortcut.
+
+## Development
+
+Build and launch the development app:
 
 ```sh
 Support/build-app.sh
 open dist/Lalia.app
 ```
 
-Requires macOS 26+, microphone, Speech Recognition, and Accessibility grants,
-plus installed compatible Speech assets. No backend, worker, settings, hotkey
-configuration, microphone chooser, or toggle mode is provided.
+Run deterministic tests and the signed bundle/Speech probe:
 
-Manual acceptance: grant permissions; focus a text editor; hold and release
-Command+Shift+D while speaking; confirm one paste and clipboard restoration
-after 150 ms. Deny each permission and confirm the focused app is unchanged.
-Press during recording/transcription must not start another dictation.
+```sh
+swift test
+shellcheck Support/*.sh Tests/System/*.sh
+Tests/System/check-app.sh
+Tests/System/check-release-package.sh
+Tests/System/check-cask-renderer.sh
+```
 
-Clipboard restoration includes only eagerly readable pasteboard data; lazy or
-promised representations are a macOS limitation.
+The Speech probe may skip only when its documented hardware, permission, or
+asset prerequisites are unavailable.

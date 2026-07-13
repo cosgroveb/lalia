@@ -1,0 +1,240 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-26
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      LALIA_CODESIGN_IDENTITY: "Developer ID Application: Brian Cosgrove (MS4LQDJJ62)"
+    steps:
+      - name: Check out Lalia
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Validate tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          semver_re='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'
+          if [[ ! $GITHUB_REF_NAME =~ $semver_re ]]; then
+            echo "invalid release tag: $GITHUB_REF_NAME" >&2
+            exit 2
+          fi
+          version=${GITHUB_REF_NAME#v}
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Install validation tools
+        run: brew install ripgrep shellcheck
+
+      - name: Verify toolchain
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          swift --version | rg -F 'Apple Swift version 6.3'
+
+      - name: Test source and packaging
+        run: |
+          set -euo pipefail
+          shellcheck Support/*.sh Tests/System/*.sh
+          ruby -c Support/render-homebrew-cask.rb
+          plutil -lint Support/Info.plist Support/Lalia.entitlements
+          swift test
+          Tests/System/check-app.sh
+          Tests/System/check-release-package.sh
+          Tests/System/check-cask-renderer.sh
+
+      - name: Import Developer ID identity
+        env:
+          CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_CERTIFICATE_P12 }}
+          CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          : "${CERTIFICATE_BASE64:?missing DEVELOPER_ID_CERTIFICATE_P12}"
+          : "${CERTIFICATE_PASSWORD:?missing DEVELOPER_ID_CERTIFICATE_PASSWORD}"
+          certificate="$RUNNER_TEMP/lalia-developer-id.p12"
+          keychain="$RUNNER_TEMP/lalia.keychain-db"
+          keychain_password=$(openssl rand -hex 32)
+          echo "::add-mask::$keychain_password"
+          printf '%s' "$CERTIFICATE_BASE64" | base64 --decode > "$certificate"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$CERTIFICATE_PASSWORD" -A -t cert -f pkcs12
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security find-identity -v -p codesigning "$keychain" | rg -F "$LALIA_CODESIGN_IDENTITY"
+
+      - name: Build Developer ID disk image
+        id: package
+        run: |
+          set -euo pipefail
+          version=${{ steps.version.outputs.version }}
+          Support/build-dmg.sh "$version"
+          dmg="$GITHUB_WORKSPACE/dist/Lalia-$version.dmg"
+          codesign --verify --verbose=4 dist/Lalia.app
+          codesign --verify --verbose=4 "$dmg"
+          printf 'dmg=%s\n' "$dmg" >> "$GITHUB_OUTPUT"
+
+      - name: Notarize and staple disk image
+        env:
+          API_KEY_BASE64: ${{ secrets.APP_STORE_CONNECT_API_KEY_P8 }}
+          API_KEY_ID: ${{ secrets.APP_STORE_CONNECT_API_KEY_ID }}
+          API_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_API_ISSUER_ID }}
+        run: |
+          set -euo pipefail
+          : "${API_KEY_BASE64:?missing APP_STORE_CONNECT_API_KEY_P8}"
+          : "${API_KEY_ID:?missing APP_STORE_CONNECT_API_KEY_ID}"
+          : "${API_ISSUER_ID:?missing APP_STORE_CONNECT_API_ISSUER_ID}"
+          key="$RUNNER_TEMP/lalia-notary-key.p8"
+          submission="$RUNNER_TEMP/notary-submission.json"
+          log="$RUNNER_TEMP/notary-log.json"
+          printf '%s' "$API_KEY_BASE64" | base64 --decode > "$key"
+          chmod 600 "$key"
+          xcrun notarytool submit "${{ steps.package.outputs.dmg }}" \
+            --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$submission"
+          jq -e '.status == "Accepted"' "$submission"
+          submission_id=$(jq -r '.id' "$submission")
+          xcrun notarytool log "$submission_id" "$log" \
+            --key "$key" --key-id "$API_KEY_ID" --issuer "$API_ISSUER_ID"
+          jq -e '[.issues[]? | select(.severity == "error")] | length == 0' "$log"
+          xcrun stapler staple "${{ steps.package.outputs.dmg }}"
+          xcrun stapler validate "${{ steps.package.outputs.dmg }}"
+          hdiutil verify "${{ steps.package.outputs.dmg }}" >/dev/null
+          spctl --assess --type open --context context:primary-signature \
+            --verbose=4 "${{ steps.package.outputs.dmg }}"
+
+      - name: Verify notarized app
+        run: |
+          set -euo pipefail
+          mount="$RUNNER_TEMP/lalia-release"
+          mkdir "$mount"
+          hdiutil attach -readonly -nobrowse -mountpoint "$mount" \
+            "${{ steps.package.outputs.dmg }}" >/dev/null
+          trap 'hdiutil detach "$mount" >/dev/null' EXIT
+          codesign --verify --deep --strict --verbose=4 "$mount/Lalia.app"
+          spctl --assess --type execute --verbose=4 "$mount/Lalia.app"
+          [[ ! -e $mount/Lalia.app/Contents/MacOS/LaliaSpeechSmoke ]]
+          hdiutil detach "$mount" >/dev/null
+          trap - EXIT
+
+      - name: Calculate release checksum
+        run: |
+          set -euo pipefail
+          dmg=${{ steps.package.outputs.dmg }}
+          sha256=$(shasum -a 256 "$dmg" | awk '{print $1}')
+          printf '%s  %s\n' "$sha256" "$(basename "$dmg")" > "$dmg.sha256"
+
+      - name: Remove temporary credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/lalia.keychain-db"
+          if [[ -e $keychain ]]; then
+            security delete-keychain "$keychain"
+          fi
+          for path in \
+            "$RUNNER_TEMP/lalia-developer-id.p12" \
+            "$RUNNER_TEMP/lalia-notary-key.p8"; do
+            if [[ -e $path ]]; then
+              rm "$path"
+            fi
+          done
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${{ steps.version.outputs.version }}
+          dmg=${{ steps.package.outputs.dmg }}
+          gh release create "$GITHUB_REF_NAME" "$dmg" "$dmg.sha256" \
+            --verify-tag --generate-notes --title "Lalia $version"
+
+  homebrew:
+    needs: release
+    runs-on: macos-26
+    steps:
+      - name: Check out Lalia
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Download published release
+        id: checksum
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version=${{ needs.release.outputs.version }}
+          release="$RUNNER_TEMP/lalia-release"
+          mkdir "$release"
+          gh release download "$GITHUB_REF_NAME" \
+            --pattern "Lalia-$version.dmg*" --dir "$release"
+          cd "$release"
+          shasum -a 256 -c "Lalia-$version.dmg.sha256"
+          sha256=$(awk '{print $1}' "Lalia-$version.dmg.sha256")
+          printf 'sha256=%s\n' "$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Check out Homebrew tap
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: cosgroveb/homebrew-tap
+          path: homebrew-tap
+          ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
+
+      - name: Render and commit cask
+        run: |
+          set -euo pipefail
+          version=${{ needs.release.outputs.version }}
+          Support/render-homebrew-cask.rb "$version" \
+            "${{ steps.checksum.outputs.sha256 }}" \
+            "$GITHUB_WORKSPACE/homebrew-tap/Casks/lalia.rb"
+          cd "$GITHUB_WORKSPACE/homebrew-tap"
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add Casks/lalia.rb
+          if git diff --cached --quiet; then
+            echo "Cask already contains Lalia $version"
+          else
+            git commit -m "Update lalia to $version"
+          fi
+
+      - name: Validate Homebrew cask
+        run: |
+          set -euo pipefail
+          brew tap cosgroveb/tap "file://$GITHUB_WORKSPACE/homebrew-tap"
+          brew style --cask cosgroveb/tap/lalia
+          brew audit --cask --strict --online cosgroveb/tap/lalia
+          brew livecheck --cask cosgroveb/tap/lalia
+          brew fetch --cask cosgroveb/tap/lalia
+          brew install --cask cosgroveb/tap/lalia
+          [[ -d /Applications/Lalia.app ]]
+          spctl --assess --type execute --verbose=4 /Applications/Lalia.app
+          brew uninstall --cask cosgroveb/tap/lalia
+
+      - name: Push Homebrew cask
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/homebrew-tap"
+          ahead=$(git rev-list --count origin/main..HEAD)
+          if [[ $ahead -gt 0 ]]; then
+            git push origin HEAD:main
+          else
+            echo 'Tap already contains this cask commit'
+          fi

@@ -5,7 +5,13 @@ cd "$root"
 Support/build-app.sh
 app=dist/Lalia.app
 plist="$app/Contents/Info.plist"
-for pair in 'CFBundleIdentifier com.bcosgrove.Lalia' 'CFBundleExecutable Lalia' 'LSMinimumSystemVersion 26.0'; do
+for pair in \
+  'CFBundleIdentifier com.bcosgrove.Lalia' \
+  'CFBundleExecutable Lalia' \
+  'CFBundlePackageType APPL' \
+  'CFBundleShortVersionString 0.0.0' \
+  'CFBundleVersion 0.0.0' \
+  'LSMinimumSystemVersion 26.0'; do
   key=${pair%% *}; expected=${pair#* }
   actual=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")
   [[ $actual == "$expected" ]]
