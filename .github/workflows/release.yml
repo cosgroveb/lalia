@@ -216,6 +216,8 @@ jobs:
           fi
 
       - name: Validate Homebrew cask
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           brew tap cosgroveb/tap "file://$GITHUB_WORKSPACE/homebrew-tap"
