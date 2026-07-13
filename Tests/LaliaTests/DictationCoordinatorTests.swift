@@ -8,14 +8,36 @@ struct DictationCoordinatorTests {
         let transcriber = TestTranscriber()
         let coordinator = makeCoordinator(transcriber: transcriber, authorizer: authorizer)
 
+        #expect(!coordinator.isDictationEnabled)
         let task = Task { await coordinator.enableDictation() }
         await Task.yield()
         #expect(coordinator.phase == .preparing)
+        #expect(!coordinator.isDictationEnabled)
         authorizer.resumeRequest()
         await task.value
 
         #expect(transcriber.prepareCalls == 1)
         #expect(coordinator.phase == .idle)
+        #expect(coordinator.isDictationEnabled)
+    }
+
+    @Test @MainActor func disablesWhileRetryingEnablement() async {
+        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted, suspendsRequest: true)
+        let coordinator = makeCoordinator(authorizer: authorizer)
+
+        let firstAttempt = Task { await coordinator.enableDictation() }
+        await Task.yield()
+        authorizer.resumeRequest()
+        await firstAttempt.value
+        #expect(coordinator.isDictationEnabled)
+
+        let retry = Task { await coordinator.enableDictation() }
+        await Task.yield()
+        #expect(coordinator.phase == .preparing)
+        #expect(!coordinator.isDictationEnabled)
+        authorizer.resumeRequest()
+        await retry.value
+        #expect(coordinator.isDictationEnabled)
     }
 
     @Test @MainActor func ignoresReleaseDuringPreparation() async {
@@ -38,6 +60,7 @@ struct DictationCoordinatorTests {
 
         await coordinator.enableDictation()
 
+        #expect(!coordinator.isDictationEnabled)
         #expect(coordinator.phase == .needsPermission)
         #expect(transcriber.prepareCalls == 0)
     }
@@ -49,7 +72,22 @@ struct DictationCoordinatorTests {
         await coordinator.enableDictation()
         coordinator.hotkeyPressed()
 
+        #expect(!coordinator.isDictationEnabled)
         #expect(coordinator.phase == .idle)
+        #expect(recorder.startCalls == 0)
+    }
+
+    @Test @MainActor func disablesWhenPermissionIsRevokedBeforeHotkeyPress() async {
+        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted)
+        let recorder = TestRecorder()
+        let coordinator = await makeReadyCoordinator(recorder: recorder, authorizer: authorizer)
+        authorizer.status = AuthorizationStatus(microphoneGranted: true, speechGranted: false, accessibilityGranted: true)
+
+        coordinator.hotkeyPressed()
+
+        #expect(!coordinator.isDictationEnabled)
+        #expect(coordinator.phase == .needsPermission)
+        #expect(coordinator.message == "Microphone, Speech, and Accessibility permissions are required.")
         #expect(recorder.startCalls == 0)
     }
 

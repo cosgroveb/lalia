@@ -14,8 +14,10 @@ import SwiftUI
         MenuBarExtra("Lalia", systemImage: "waveform") {
             Text(coordinator.message)
             if let hotkeyError = coordinator.hotkeyError { Text(hotkeyError) }
-            Button("Enable Dictation") { Task { await coordinator.enableDictation() } }
-                .disabled(coordinator.phase == .preparing || coordinator.phase == .recording || coordinator.phase == .transcribing || coordinator.phase == .pasting)
+            if !coordinator.isDictationEnabled {
+                Button("Enable Dictation") { Task { await coordinator.enableDictation() } }
+                    .disabled(coordinator.phase == .preparing || coordinator.phase == .recording || coordinator.phase == .transcribing || coordinator.phase == .pasting)
+            }
             Button("Copy Last Transcript") { coordinator.copyLastTranscript() }.disabled(coordinator.lastTranscript == nil)
             Divider()
             Button("Quit") { NSApplication.shared.terminate(nil) }
