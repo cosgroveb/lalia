@@ -30,7 +30,7 @@ app="$mount/Lalia.app"
 plist="$app/Contents/Info.plist"
 [[ -d $app ]]
 [[ -L $mount/Applications ]]
-[[ ! -e $app/Contents/MacOS/LaliaSpeechSmoke ]]
+[[ $(ls -A "$app/Contents/MacOS") == Lalia ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundlePackageType' "$plist") == APPL ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist") == 1.2.3 ]]
 [[ $(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$plist") == 1.2.3 ]]

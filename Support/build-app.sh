@@ -33,9 +33,7 @@ if [[ $identity == - ]]; then
 fi
 
 if [[ $distribution -eq 0 ]]; then
-  cp .build/release/LaliaSpeechSmoke "$app/Contents/MacOS/"
-  codesign --force --sign "$identity" "${timestamp[@]}" "$app/Contents/MacOS/LaliaSpeechSmoke"
-  codesign --force --sign "$identity" "${timestamp[@]}" "$app"
+  codesign --force --sign "$identity" "${timestamp[@]}" --entitlements Support/Lalia.entitlements "$app"
 else
   codesign --force --sign "$identity" "${timestamp[@]}" --options runtime \
     --entitlements Support/Lalia.entitlements "$app"

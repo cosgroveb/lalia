@@ -18,19 +18,17 @@ for pair in \
 done
 /usr/libexec/PlistBuddy -c 'Print :LSUIElement' "$plist" | rg -qx 'true|1'
 /usr/libexec/PlistBuddy -c 'Print :NSMicrophoneUsageDescription' "$plist" >/dev/null
-/usr/libexec/PlistBuddy -c 'Print :NSSpeechRecognitionUsageDescription' "$plist" >/dev/null
-codesign --verify --deep --strict "$app"
-fixture=$(mktemp /tmp/lalia-speech-fixture.XXXXXX.wav)
-trap 'rm -f "$fixture"' EXIT
-/usr/bin/say -o "${fixture%.wav}.aiff" 'Lalia speech check'
-/usr/bin/afconvert -f WAVE -d LEI16@16000 -c 1 "${fixture%.wav}.aiff" -o "$fixture"
-rm -f "${fixture%.wav}.aiff"
-set +e
-"$app/Contents/MacOS/LaliaSpeechSmoke" "$fixture"
-status=$?
-set -e
-if [[ $status -eq 77 ]]; then
-  echo 'SKIP: real Speech prerequisites unavailable'
-  exit 0
+/usr/libexec/PlistBuddy -c 'Print :NSAudioCaptureUsageDescription' "$plist" >/dev/null
+/usr/libexec/PlistBuddy -c 'Print :NSAppTransportSecurity:NSAllowsLocalNetworking' "$plist" | rg -qx 'true|1'
+if /usr/libexec/PlistBuddy -c 'Print :NSSpeechRecognitionUsageDescription' "$plist" >/dev/null 2>&1; then
+  echo 'obsolete Speech permission remains' >&2
+  exit 1
 fi
-exit "$status"
+codesign --verify --deep --strict "$app"
+python3 Tests/System/check-http.py "$app/Contents/MacOS/Lalia"
+if [[ ${LALIA_LIVE_ASR:-0} == 1 ]]; then
+  : "${LALIA_ASR_FIXTURE:?set LALIA_ASR_FIXTURE to a speech recording for the live check}"
+  "$app/Contents/MacOS/Lalia" --transcribe-file "$LALIA_ASR_FIXTURE"
+else
+  echo 'Live ASR not run. Set LALIA_LIVE_ASR=1 and LALIA_ASR_FIXTURE to request it.'
+fi

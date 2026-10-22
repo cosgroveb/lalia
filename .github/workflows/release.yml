@@ -131,7 +131,7 @@ jobs:
           trap 'hdiutil detach "$mount" >/dev/null' EXIT
           codesign --verify --deep --strict --verbose=4 "$mount/Lalia.app"
           spctl --assess --type execute --verbose=4 "$mount/Lalia.app"
-          [[ ! -e $mount/Lalia.app/Contents/MacOS/LaliaSpeechSmoke ]]
+          [[ $(ls -A "$mount/Lalia.app/Contents/MacOS") == Lalia ]]
           hdiutil detach "$mount" >/dev/null
           trap - EXIT
 

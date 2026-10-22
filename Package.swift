@@ -6,11 +6,9 @@ let package = Package(
     platforms: [.macOS(.v26)],
     products: [
         .executable(name: "Lalia", targets: ["Lalia"]),
-        .executable(name: "LaliaSpeechSmoke", targets: ["LaliaSpeechSmoke"]),
     ],
     targets: [
         .executableTarget(name: "Lalia"),
-        .executableTarget(name: "LaliaSpeechSmoke"),
         .testTarget(name: "LaliaTests", dependencies: ["Lalia"]),
     ]
 )

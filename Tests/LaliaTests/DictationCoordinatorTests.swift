@@ -1,292 +1,270 @@
+import AVFoundation
 import Foundation
 import Testing
 @testable import Lalia
 
-struct DictationCoordinatorTests {
-    @Test @MainActor func enablesOnlyAfterAuthorizationAndPreparation() async {
-        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted, suspendsRequest: true)
-        let transcriber = TestTranscriber()
-        let coordinator = makeCoordinator(transcriber: transcriber, authorizer: authorizer)
-
-        #expect(!coordinator.isDictationEnabled)
-        let task = Task { await coordinator.enableDictation() }
-        await Task.yield()
-        #expect(coordinator.phase == .preparing)
-        #expect(!coordinator.isDictationEnabled)
-        authorizer.resumeRequest()
+@MainActor struct DictationCoordinatorTests {
+    @Test func enablesOfflineAndGatesOverlappingHotkeys() async throws {
+        let test = CoordinatorFixture()
+        test.transcriber.prepareError = TestError.failed
+        await test.coordinator.enableDictation()
+        #expect(test.coordinator.isDictationEnabled)
+        #expect(test.transcriber.prepareCalls == 0)
+        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyPressed()
+        #expect(test.recorder.startCalls == 1)
+        await test.coordinator.enableDictation()
+        #expect(test.authorizer.requestCalls == 1)
+        test.coordinator.hotkeyReleased(); test.coordinator.hotkeyReleased()
+        await test.coordinator.waitForOperation()
+        #expect(test.recorder.stopCalls == 1)
+        let saved = try #require(test.coordinator.sessions.first)
+        #expect(saved.segments[0].complete)
+        #expect(FileManager.default.fileExists(atPath: try test.storage.store.file(saved.id, saved.segments[0].filename).path))
+    }
+    @Test func authorizationDenialAndRevocationPreventDictation() async {
+        let test = CoordinatorFixture()
+        test.authorizer.status = AuthorizationStatus(microphoneGranted: false, accessibilityGranted: true)
+        await test.coordinator.enableDictation()
+        #expect(test.coordinator.phase == .needsPermission)
+        #expect(!test.coordinator.isDictationEnabled)
+        test.coordinator.hotkeyReleased()
+        #expect(test.recorder.stopCalls == 0)
+        test.authorizer.status = TestAuthorizer.granted
+        await test.coordinator.enableDictation()
+        test.authorizer.status = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: false)
+        test.coordinator.hotkeyPressed()
+        #expect(test.coordinator.phase == .needsPermission)
+        #expect(test.recorder.startCalls == 0)
+    }
+    @Test func ignoresReleaseAndReenableDuringPermissionRequest() async {
+        let test = CoordinatorFixture()
+        test.authorizer.suspend = true
+        let task = Task { await test.coordinator.enableDictation() }
+        while !test.authorizer.waiting { await Task.yield() }
+        #expect(test.coordinator.phase == .preparing)
+        test.coordinator.hotkeyReleased()
+        await test.coordinator.enableDictation()
+        #expect(test.authorizer.requestCalls == 1)
+        #expect(test.recorder.stopCalls == 0)
+        test.authorizer.resume()
         await task.value
-
-        #expect(transcriber.prepareCalls == 1)
-        #expect(coordinator.phase == .idle)
-        #expect(coordinator.isDictationEnabled)
+        #expect(test.coordinator.isDictationEnabled)
     }
-
-    @Test @MainActor func disablesWhileRetryingEnablement() async {
-        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted, suspendsRequest: true)
-        let coordinator = makeCoordinator(authorizer: authorizer)
-
-        let firstAttempt = Task { await coordinator.enableDictation() }
-        await Task.yield()
-        authorizer.resumeRequest()
-        await firstAttempt.value
-        #expect(coordinator.isDictationEnabled)
-
-        let retry = Task { await coordinator.enableDictation() }
-        await Task.yield()
-        #expect(coordinator.phase == .preparing)
-        #expect(!coordinator.isDictationEnabled)
-        authorizer.resumeRequest()
-        await retry.value
-        #expect(coordinator.isDictationEnabled)
+    @Test func startStopAndTranscriptionFailuresRetainAudio() async throws {
+        for failure in ["start", "stop", "transcription"] {
+            let test = CoordinatorFixture()
+            if failure == "start" { test.recorder.startError = TestError.failed }
+            if failure == "stop" { test.recorder.stopError = TestError.failed }
+            if failure == "transcription" { test.transcriber.transcriptionError = TestError.failed }
+            await test.coordinator.enableDictation()
+            test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+            await test.coordinator.waitForOperation()
+            #expect(test.coordinator.phase == .idle)
+            #expect(test.injector.injected.isEmpty)
+            let record = try #require(test.coordinator.sessions.first)
+            let source = record.segments[0]
+            let file = try test.storage.store.file(record.id, source.complete ? source.filename : source.partialFilename)
+            #expect(FileManager.default.fileExists(atPath: file.path))
+            test.transcriber.transcriptionError = nil
+            test.coordinator.retry(record.id)
+            await test.coordinator.waitForOperation()
+            #expect(try test.storage.store.read(record.id).segments[0].complete)
+            #expect(try test.storage.store.read(record.id).transcriptionComplete)
+        }
     }
-
-    @Test @MainActor func ignoresReleaseDuringPreparation() async {
-        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted, suspendsRequest: true)
-        let recorder = TestRecorder()
-        let coordinator = makeCoordinator(recorder: recorder, authorizer: authorizer)
-
-        let task = Task { await coordinator.enableDictation() }
-        await Task.yield()
-        coordinator.hotkeyReleased()
-        #expect(recorder.stopCalls == 0)
-        authorizer.resumeRequest()
-        await task.value
+    @Test func preservesPasteSafeguardsAndCopy() async {
+        for failure in ["empty", "permission", "paste", "none"] {
+            let test = CoordinatorFixture()
+            await test.coordinator.enableDictation()
+            test.coordinator.hotkeyPressed()
+            if failure == "empty" { test.transcriber.output = " \n\t" }
+            if failure == "permission" { test.authorizer.status = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: false) }
+            if failure == "paste" { test.injector.injectionError = TestError.failed }
+            test.coordinator.hotkeyReleased()
+            await test.coordinator.waitForOperation()
+            if failure == "empty" {
+                #expect(test.coordinator.lastTranscript == nil)
+                #expect(test.injector.injected.isEmpty)
+            } else {
+                #expect(test.coordinator.lastTranscript == "spoken text")
+                test.coordinator.copyLastTranscript()
+                #expect(test.injector.copied == ["spoken text"])
+                #expect(test.injector.injected == (failure == "permission" ? [] : ["spoken text"]))
+            }
+        }
     }
-
-    @Test @MainActor func remainsNeedingPermissionWhenAuthorizationIsDenied() async {
-        let denied = AuthorizationStatus(microphoneGranted: false, speechGranted: true, accessibilityGranted: true)
-        let transcriber = TestTranscriber()
-        let coordinator = makeCoordinator(transcriber: transcriber, authorizer: TestAuthorizer(status: denied, requestedStatus: denied))
-
-        await coordinator.enableDictation()
-
-        #expect(!coordinator.isDictationEnabled)
-        #expect(coordinator.phase == .needsPermission)
-        #expect(transcriber.prepareCalls == 0)
+    @Test func sessionsDoNotRequireAccessibilityOrServerAndQuitFinalizes() async throws {
+        let test = CoordinatorFixture()
+        test.authorizer.status = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: false)
+        test.transcriber.prepareError = TestError.failed
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.phase == .recordingSession)
+        test.coordinator.hotkeyPressed()
+        test.coordinator.startSession()
+        #expect(test.recorder.startCalls == 0)
+        #expect(test.capture.startCalls == 1)
+        #expect(test.transcriber.prepareCalls == 0)
+        await test.coordinator.shutdown()
+        #expect(test.capture.stopCalls == 1)
+        #expect(try test.storage.store.history().records[0].segments[0].complete)
+        #expect(test.transcriber.prepareCalls == 0)
     }
-
-    @Test @MainActor func returnsToIdleWhenPreparationFails() async {
-        let recorder = TestRecorder()
-        let coordinator = makeCoordinator(recorder: recorder, transcriber: TestTranscriber(prepareError: TestError.failed), authorizer: TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted))
-
-        await coordinator.enableDictation()
-        coordinator.hotkeyPressed()
-
-        #expect(!coordinator.isDictationEnabled)
-        #expect(coordinator.phase == .idle)
-        #expect(recorder.startCalls == 0)
+    @Test func captureDenialAndUnexpectedFailureAreVisible() async throws {
+        let denied = CoordinatorFixture()
+        denied.capture.startError = TestError.failed
+        denied.coordinator.startSession()
+        await denied.coordinator.waitForOperation()
+        #expect(denied.coordinator.phase == .idle)
+        #expect(denied.coordinator.sessions[0].captureState == .failed)
+        let failed = CoordinatorFixture()
+        failed.coordinator.startSession()
+        await failed.coordinator.waitForOperation()
+        failed.capture.fail?(TestError.failed)
+        await failed.coordinator.waitForOperation()
+        #expect(failed.coordinator.sessions[0].captureState == .failed)
+        #expect(failed.coordinator.sessions[0].segments[0].complete)
+        #expect(failed.coordinator.message.contains("Failed."))
     }
-
-    @Test @MainActor func disablesWhenPermissionIsRevokedBeforeHotkeyPress() async {
-        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted)
-        let recorder = TestRecorder()
-        let coordinator = await makeReadyCoordinator(recorder: recorder, authorizer: authorizer)
-        authorizer.status = AuthorizationStatus(microphoneGranted: true, speechGranted: false, accessibilityGranted: true)
-
-        coordinator.hotkeyPressed()
-
-        #expect(!coordinator.isDictationEnabled)
-        #expect(coordinator.phase == .needsPermission)
-        #expect(coordinator.message == "Microphone, Speech, and Accessibility permissions are required.")
-        #expect(recorder.startCalls == 0)
+    @Test func retryPreservesCompletedResponsesAndNotesStaySeparate() async throws {
+        let test = CoordinatorFixture()
+        let saved = try savedAudio(test.storage.store)
+        try AudioJobPreparer().prepare(session: saved.id, store: test.storage.store)
+        let first = try test.storage.store.read(saved.id).jobs[0]
+        var second = first; second.id = "second"; second.start = 2
+        try test.storage.store.update(saved.id) { $0.jobs.append(second) }
+        test.transcriber.failCall = 2
+        test.coordinator.retry(saved.id)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.transcriptionCalls == 2)
+        #expect(try test.storage.store.read(saved.id).jobs.map(\.state) == [.complete, .failed])
+        test.transcriber.failCall = nil
+        test.coordinator.retry(saved.id)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.transcriptionCalls == 3)
+        let transcript = try test.storage.store.read(saved.id).transcript
+        #expect(try test.storage.store.read(saved.id).plainTranscript == "spoken text spoken text")
+        test.transcriber.notesError = TestError.failed
+        test.coordinator.generateNotes(saved.id)
+        await test.coordinator.waitForOperation()
+        #expect(try test.storage.store.read(saved.id).transcript == transcript)
+        #expect(try test.storage.store.read(saved.id).notes == nil)
+        test.transcriber.notesError = nil
+        test.coordinator.generateNotes(saved.id)
+        await test.coordinator.waitForOperation()
+        #expect(try test.storage.store.read(saved.id).notes == "notes")
+        #expect(try test.storage.store.read(saved.id).transcript == transcript)
     }
-
-    @Test @MainActor func ignoresEnablementWhileDictationIsActive() async {
-        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted)
-        let recorder = TestRecorder()
-        let coordinator = await makeReadyCoordinator(recorder: recorder, authorizer: authorizer)
-
-        coordinator.hotkeyPressed()
-        await coordinator.enableDictation()
-
-        #expect(coordinator.phase == .recording)
-        #expect(authorizer.requestCalls == 1)
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
+    @Test func cancellationKeepsFilesAndExcludesCaptureDuringInference() async throws {
+        let test = CoordinatorFixture()
+        let saved = try savedAudio(test.storage.store)
+        test.transcriber.suspend = true
+        test.coordinator.retry(saved.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.startSession(); test.coordinator.hotkeyPressed(); test.coordinator.generateNotes(saved.id)
+        #expect(test.capture.startCalls == 0)
+        #expect(test.recorder.startCalls == 0)
+        #expect(test.coordinator.phase == .transcribing)
+        test.coordinator.cancelProcessing()
+        test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.message.contains("cancelled"))
+        #expect(try test.storage.store.read(saved.id).jobs[0].state == .failed)
+        #expect(try test.storage.store.read(saved.id).segments[0].complete)
     }
-
-    @Test @MainActor func gatesOverlappingPressesAndReleases() async {
-        let recorder = TestRecorder()
-        let coordinator = await makeReadyCoordinator(recorder: recorder)
-
-        coordinator.hotkeyPressed()
-        coordinator.hotkeyPressed()
-        #expect(recorder.startCalls == 1)
-        #expect(coordinator.phase == .recording)
-
-        coordinator.hotkeyReleased()
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
-        #expect(recorder.stopCalls == 1)
-        #expect(recorder.discardCalls == 1)
+    @Test func copyFailuresAndHotkeyRegistrationRemainVisible() async {
+        let test = CoordinatorFixture()
+        await test.coordinator.enableDictation()
+        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        await test.coordinator.waitForOperation()
+        test.injector.copyError = TestError.failed
+        test.coordinator.copyLastTranscript()
+        test.coordinator.hotkeyRegistrationFailed(TestError.failed)
+        #expect(test.coordinator.message == "Failed.")
+        #expect(test.coordinator.hotkeyError?.contains("Failed.") == true)
     }
-
-    @Test @MainActor func discardsWhenRecorderStartFails() async {
-        let recorder = TestRecorder(startError: TestError.failed)
-        let coordinator = await makeReadyCoordinator(recorder: recorder)
-
-        coordinator.hotkeyPressed()
-
-        #expect(recorder.discardCalls == 1)
-        #expect(coordinator.phase == .idle)
-    }
-
-    @Test @MainActor func discardsWhenRecorderStopFails() async {
-        let recorder = TestRecorder(stopError: TestError.failed)
-        let coordinator = await makeReadyCoordinator(recorder: recorder)
-
-        coordinator.hotkeyPressed()
-        coordinator.hotkeyReleased()
-
-        #expect(recorder.discardCalls == 1)
-        #expect(coordinator.phase == .idle)
-    }
-
-    @Test @MainActor func discardsWhenTranscriptionFails() async {
-        let recorder = TestRecorder()
-        let transcriber = TestTranscriber(transcriptionError: TestError.failed)
-        let coordinator = await makeReadyCoordinator(recorder: recorder, transcriber: transcriber)
-
-        coordinator.hotkeyPressed()
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
-
-        #expect(recorder.discardCalls == 1)
-        #expect(coordinator.lastTranscript == nil)
-    }
-
-    @Test @MainActor func doesNotInjectEmptyOutput() async {
-        let recorder = TestRecorder()
-        let injector = TestInjector()
-        let coordinator = await makeReadyCoordinator(recorder: recorder, transcriber: TestTranscriber(output: " \n\t "), injector: injector)
-
-        coordinator.hotkeyPressed()
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
-
-        #expect(injector.injected == [])
-        #expect(coordinator.lastTranscript == nil)
-        #expect(coordinator.message == "No speech recognized.")
-        #expect(recorder.discardCalls == 1)
-    }
-
-    @Test @MainActor func doesNotInjectWhenAccessibilityIsDenied() async {
-        let authorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted)
-        let recorder = TestRecorder()
-        let injector = TestInjector()
-        let coordinator = await makeReadyCoordinator(recorder: recorder, injector: injector, authorizer: authorizer)
-
-        coordinator.hotkeyPressed()
-        authorizer.status = AuthorizationStatus(microphoneGranted: true, speechGranted: true, accessibilityGranted: false)
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
-
-        #expect(injector.injected == [])
-        #expect(coordinator.lastTranscript == "spoken text")
-        #expect(coordinator.message == "Accessibility permission is required to paste.")
-        #expect(recorder.discardCalls == 1)
-    }
-
-    @Test @MainActor func retainsTranscriptWhenInjectionFails() async {
-        let recorder = TestRecorder()
-        let injector = TestInjector(injectionError: TestError.failed)
-        let coordinator = await makeReadyCoordinator(recorder: recorder, injector: injector)
-
-        coordinator.hotkeyPressed()
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
-
-        #expect(injector.injected == ["spoken text"])
-        #expect(coordinator.lastTranscript == "spoken text")
-        #expect(recorder.discardCalls == 1)
-    }
-
-    @Test @MainActor func completesFullPipelineAndCopiesLastTranscript() async {
-        let recorder = TestRecorder()
-        let injector = TestInjector()
-        let coordinator = await makeReadyCoordinator(recorder: recorder, injector: injector)
-
-        coordinator.hotkeyPressed()
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
-        coordinator.copyLastTranscript()
-
-        #expect(injector.injected == ["spoken text"])
-        #expect(injector.copied == ["spoken text"])
-        #expect(recorder.discardCalls == 1)
-        #expect(coordinator.phase == .idle)
-    }
-
-    @Test @MainActor func showsCopyFailure() async {
-        let injector = TestInjector(copyError: TestError.failed)
-        let coordinator = await makeReadyCoordinator(injector: injector)
-
-        coordinator.hotkeyPressed()
-        coordinator.hotkeyReleased()
-        await waitForIdle(coordinator)
-        coordinator.copyLastTranscript()
-
-        #expect(coordinator.message == "Failed.")
-    }
-}
-
-@MainActor private func makeReadyCoordinator(
-    recorder: TestRecorder = TestRecorder(),
-    transcriber: TestTranscriber = TestTranscriber(),
-    injector: TestInjector = TestInjector(),
-    authorizer: TestAuthorizer = TestAuthorizer(status: TestAuthorizer.granted, requestedStatus: TestAuthorizer.granted)
-) async -> DictationCoordinator {
-    let coordinator = makeCoordinator(recorder: recorder, transcriber: transcriber, injector: injector, authorizer: authorizer)
-    await coordinator.enableDictation()
-    return coordinator
-}
-
-@MainActor private func makeCoordinator(
-    recorder: TestRecorder = TestRecorder(),
-    transcriber: TestTranscriber = TestTranscriber(),
-    injector: TestInjector = TestInjector(),
-    authorizer: TestAuthorizer
-) -> DictationCoordinator {
-    DictationCoordinator(recorder: recorder, transcriber: transcriber, injector: injector, authorizer: authorizer)
-}
-
-@MainActor private func waitForIdle(_ coordinator: DictationCoordinator) async {
-    for _ in 0..<20 where coordinator.phase != .idle { await Task.yield() }
 }
 
 private enum TestError: LocalizedError { case failed; var errorDescription: String? { "Failed." } }
 
+@MainActor private final class CoordinatorFixture {
+    let storage = TemporaryStore()
+    let recorder = TestRecorder()
+    let capture = TestCapture()
+    let transcriber = TestTranscriber()
+    let injector = TestInjector()
+    let authorizer = TestAuthorizer()
+    lazy var coordinator = DictationCoordinator(recorder: recorder, transcriber: transcriber, injector: injector, authorizer: authorizer, store: storage.store, capture: capture)
+}
+
 private final class TestRecorder: Recording {
-    var startCalls = 0; var stopCalls = 0; var discardCalls = 0
-    let startError: Error?; let stopError: Error?
-    init(startError: Error? = nil, stopError: Error? = nil) { self.startError = startError; self.stopError = stopError }
-    func start() throws { startCalls += 1; if let startError { throw startError } }
-    func stop() throws -> URL { stopCalls += 1; if let stopError { throw stopError }; return URL(fileURLWithPath: "/tmp/lalia-test.wav") }
-    func discard() { discardCalls += 1 }
+    var startCalls = 0; var stopCalls = 0
+    var startError: Error?; var stopError: Error?
+    func start(at url: URL) throws {
+        startCalls += 1
+        let buffer = try pcm(rate: 16_000, channels: 1, frames: 16_000)
+        let file = try AVAudioFile(forWriting: url, settings: recorderSettings)
+        try file.write(from: buffer)
+        if let startError { throw startError }
+    }
+    func stop() throws { stopCalls += 1; if let stopError { throw stopError } }
+    func close() {}
+}
+
+@MainActor private final class TestCapture: SessionCapturing {
+    var startCalls = 0; var stopCalls = 0
+    var startError: Error?
+    var fail: (@MainActor @Sendable (Error) -> Void)?
+    var writer: SourceAudioWriter?
+    func start(session: UUID, store: SessionStore, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
+        startCalls += 1; fail = failed
+        if let startError { throw startError }
+        writer = SourceAudioWriter(store: store, session: session, origin: 0)
+        try writer?.append(pcm(frames: 48_000), source: .microphone, timestamp: 0)
+    }
+    func stop() async throws { stopCalls += 1; try writer?.finish(); writer = nil }
 }
 
 @MainActor private final class TestTranscriber: Transcribing {
-    var prepareCalls = 0
-    let output: String; let prepareError: Error?; let transcriptionError: Error?
-    init(output: String = "spoken text", prepareError: Error? = nil, transcriptionError: Error? = nil) { self.output = output; self.prepareError = prepareError; self.transcriptionError = transcriptionError }
+    var prepareCalls = 0; var transcriptionCalls = 0
+    var output = "spoken text"
+    var prepareError: Error?; var transcriptionError: Error?; var notesError: Error?
+    var failCall: Int?
+    var suspend = false
+    var waiting = false
+    private var continuation: CheckedContinuation<Void, Never>?
     func prepare() async throws { prepareCalls += 1; if let prepareError { throw prepareError } }
-    func transcribe(_: URL) async throws -> String { if let transcriptionError { throw transcriptionError }; return output }
+    func transcribe(_: URL) async throws -> Transcription {
+        transcriptionCalls += 1
+        if suspend { waiting = true; await withCheckedContinuation { continuation = $0 }; waiting = false }
+        if let transcriptionError { throw transcriptionError }
+        if failCall == transcriptionCalls { throw TestError.failed }
+        return Transcription(text: output)
+    }
+    func resume() { continuation?.resume(); continuation = nil }
+    func notes(for _: String) async throws -> String { if let notesError { throw notesError }; return "notes" }
 }
 
 @MainActor private final class TestInjector: Injecting {
     var injected: [String] = []; var copied: [String] = []
-    let injectionError: Error?; let copyError: Error?
-    init(injectionError: Error? = nil, copyError: Error? = nil) { self.injectionError = injectionError; self.copyError = copyError }
+    var injectionError: Error?; var copyError: Error?
     func inject(_ text: String) async throws { injected.append(text); if let injectionError { throw injectionError } }
     func copy(_ text: String) throws { copied.append(text); if let copyError { throw copyError } }
 }
 
 @MainActor private final class TestAuthorizer: Authorizing {
-    static let granted = AuthorizationStatus(microphoneGranted: true, speechGranted: true, accessibilityGranted: true)
-    var status: AuthorizationStatus; let requestedStatus: AuthorizationStatus; let suspendsRequest: Bool; var requestCalls = 0
+    static let granted = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: true)
+    var status = granted
+    var requestCalls = 0
+    var suspend = false
+    var waiting = false
     private var continuation: CheckedContinuation<Void, Never>?
-    init(status: AuthorizationStatus, requestedStatus: AuthorizationStatus, suspendsRequest: Bool = false) { self.status = status; self.requestedStatus = requestedStatus; self.suspendsRequest = suspendsRequest }
     func currentStatus() -> AuthorizationStatus { status }
-    func requestAll() async -> AuthorizationStatus { requestCalls += 1; if suspendsRequest { await withCheckedContinuation { continuation = $0 } }; status = requestedStatus; return status }
-    func resumeRequest() { continuation?.resume(); continuation = nil }
+    func requestAll() async -> AuthorizationStatus {
+        requestCalls += 1
+        if suspend { waiting = true; await withCheckedContinuation { continuation = $0 }; waiting = false }
+        return status
+    }
+    func requestMicrophone() async -> Bool { status.microphoneGranted }
+    func resume() { continuation?.resume(); continuation = nil }
 }

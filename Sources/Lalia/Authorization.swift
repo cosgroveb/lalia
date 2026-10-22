@@ -1,21 +1,20 @@
 import AVFAudio
 import ApplicationServices
 import Foundation
-import Speech
 
 @MainActor final class SystemAuthorizer: Authorizing {
     func currentStatus() -> AuthorizationStatus {
         AuthorizationStatus(
             microphoneGranted: AVAudioApplication.shared.recordPermission == .granted,
-            speechGranted: SFSpeechRecognizer.authorizationStatus() == .authorized,
             accessibilityGranted: AXIsProcessTrusted()
         )
     }
+    func requestMicrophone() async -> Bool {
+        if AVAudioApplication.shared.recordPermission == .undetermined { return await AVAudioApplication.requestRecordPermission() }
+        return currentStatus().microphoneGranted
+    }
     func requestAll() async -> AuthorizationStatus {
-        if AVAudioApplication.shared.recordPermission == .undetermined { _ = await AVAudioApplication.requestRecordPermission() }
-        if SFSpeechRecognizer.authorizationStatus() == .notDetermined {
-            _ = await withCheckedContinuation { continuation in SFSpeechRecognizer.requestAuthorization { continuation.resume(returning: $0) } }
-        }
+        _ = await requestMicrophone()
         if !AXIsProcessTrusted() { AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) }
         return currentStatus()
     }
