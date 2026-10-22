@@ -110,6 +110,43 @@ import Testing
         #expect(try test.storage.store.history().records[0].segments[0].complete)
         #expect(test.transcriber.prepareCalls == 0)
     }
+    @Test func recordingToggleSavesTranscribesAndStartsANewSession() async throws {
+        let test = CoordinatorFixture()
+        test.authorizer.status = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: false)
+        for count in 1...2 {
+            test.coordinator.toggleRecording()
+            #expect(test.coordinator.phase == .preparing)
+            test.coordinator.toggleRecording()
+            await test.coordinator.waitForOperation()
+            #expect(test.coordinator.phase == .recordingSession)
+            #expect(test.capture.startCalls == count)
+            test.coordinator.hotkeyReleased()
+            #expect(test.coordinator.phase == .recordingSession)
+            test.coordinator.toggleRecording()
+            #expect(test.coordinator.phase == .stopping)
+            test.coordinator.toggleRecording()
+            await test.coordinator.waitForOperation()
+            #expect(test.capture.stopCalls == count)
+            #expect(test.coordinator.phase == .idle)
+        }
+        #expect(test.coordinator.sessions.count == 2)
+        #expect(test.coordinator.sessions.allSatisfy { $0.captureState == .complete && $0.transcriptionComplete })
+        #expect(test.transcriber.transcriptionCalls == 2)
+        #expect(test.injector.injected.isEmpty)
+        #expect(test.recorder.startCalls == 0)
+    }
+    @Test func recordingToggleDoesNotInterruptDictation() async {
+        let test = CoordinatorFixture()
+        await test.coordinator.enableDictation()
+        test.coordinator.hotkeyPressed()
+        test.coordinator.toggleRecording()
+        #expect(test.coordinator.phase == .recording)
+        #expect(test.capture.startCalls == 0)
+        #expect(test.recorder.stopCalls == 0)
+        test.coordinator.hotkeyReleased()
+        await test.coordinator.waitForOperation()
+        #expect(test.injector.injected == ["spoken text"])
+    }
     @Test func captureDenialAndUnexpectedFailureAreVisible() async throws {
         let denied = CoordinatorFixture()
         denied.capture.startError = TestError.failed
@@ -161,7 +198,7 @@ import Testing
         test.transcriber.suspend = true
         test.coordinator.retry(saved.id)
         while !test.transcriber.waiting { await Task.yield() }
-        test.coordinator.startSession(); test.coordinator.hotkeyPressed(); test.coordinator.generateNotes(saved.id)
+        test.coordinator.toggleRecording(); test.coordinator.hotkeyPressed(); test.coordinator.generateNotes(saved.id)
         #expect(test.capture.startCalls == 0)
         #expect(test.recorder.startCalls == 0)
         #expect(test.coordinator.phase == .transcribing)
@@ -179,9 +216,12 @@ import Testing
         await test.coordinator.waitForOperation()
         test.injector.copyError = TestError.failed
         test.coordinator.copyLastTranscript()
-        test.coordinator.hotkeyRegistrationFailed(TestError.failed)
+        test.coordinator.hotkeyRegistrationFailed(TestError.failed, shortcut: .dictation)
+        test.coordinator.hotkeyRegistrationFailed(TestError.failed, shortcut: .recording)
         #expect(test.coordinator.message == "Failed.")
         #expect(test.coordinator.hotkeyError?.contains("Failed.") == true)
+        #expect(test.coordinator.hotkeyError?.contains("⇧⌘D") == true)
+        #expect(test.coordinator.hotkeyError?.contains("⇧⌘R") == true)
     }
 }
 

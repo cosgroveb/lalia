@@ -60,13 +60,18 @@ import UniformTypeIdentifiers
 struct LaliaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var coordinator: DictationCoordinator
-    private let hotkey: CarbonHotkey
+    private let hotkeys: [CarbonHotkey]
     init() {
         let coordinator = DictationCoordinator(recorder: Recorder(), transcriber: OMLXClient(), injector: PasteInjector(), authorizer: SystemAuthorizer())
         _coordinator = StateObject(wrappedValue: coordinator)
-        hotkey = CarbonHotkey(pressed: { coordinator.hotkeyPressed() }, released: { coordinator.hotkeyReleased() })
+        hotkeys = [
+            CarbonHotkey(shortcut: .dictation, pressed: { coordinator.hotkeyPressed() }, released: { coordinator.hotkeyReleased() }),
+            CarbonHotkey(shortcut: .recording, pressed: { coordinator.toggleRecording() }),
+        ]
         coordinator.startupRefresh()
-        do { try hotkey.register() } catch { coordinator.hotkeyRegistrationFailed(error) }
+        for hotkey in hotkeys {
+            do { try hotkey.register() } catch { coordinator.hotkeyRegistrationFailed(error, shortcut: hotkey.shortcut) }
+        }
         delegate.coordinator = coordinator
     }
     var body: some Scene {
@@ -91,13 +96,23 @@ private struct LaliaMenu: View {
         if !coordinator.isDictationEnabled {
             Button("Enable Dictation") { Task { await coordinator.enableDictation() } }.disabled(!coordinator.available)
         }
-        if coordinator.phase == .recordingSession { Button("Stop Session") { coordinator.stopSession() } }
-        else { Button("Start Session") { coordinator.startSession() }.disabled(!coordinator.available) }
+        RecordingButton(coordinator: coordinator)
         if coordinator.canCancel { Button("Cancel Processing") { coordinator.cancelProcessing() } }
         Button("Recording History") { coordinator.refreshHistory(); openWindow(id: "history"); NSApp.activate() }
         Button("Copy Last Transcript") { coordinator.copyLastTranscript() }.disabled(coordinator.lastTranscript == nil)
         Divider()
         Button("Quit") { NSApplication.shared.terminate(nil) }
+    }
+}
+
+private struct RecordingButton: View {
+    @ObservedObject var coordinator: DictationCoordinator
+    var body: some View {
+        Button(coordinator.phase == .recordingSession ? "Stop Recording (⇧⌘R)" : "Start Recording (⇧⌘R)") {
+            coordinator.toggleRecording()
+        }
+        .disabled(coordinator.phase != .recordingSession && !coordinator.available)
+        .help("Record microphone and Mac audio until stopped, then transcribe.")
     }
 }
 
@@ -137,6 +152,7 @@ private struct HistoryView: View {
                 }
             } else { Text("Select a recording.") }
         }
+        .toolbar { RecordingButton(coordinator: coordinator) }
         .safeAreaInset(edge: .bottom) {
             VStack(alignment: .leading) {
                 Text(coordinator.message)

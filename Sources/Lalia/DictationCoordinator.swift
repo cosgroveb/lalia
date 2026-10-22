@@ -3,7 +3,7 @@ import Foundation
 
 @MainActor final class DictationCoordinator: ObservableObject {
     @Published private(set) var phase: Phase = .needsPermission
-    @Published private(set) var message = "Enable Dictation or start a session."
+    @Published private(set) var message = "Press ⇧⌘R to record, or enable dictation."
     @Published private(set) var lastTranscript: String?
     @Published private(set) var hotkeyError: String?
     @Published private(set) var isDictationEnabled = false
@@ -119,6 +119,10 @@ import Foundation
         guard phase == .recordingSession else { return }
         phase = .stopping; message = "Saving recording…"
         operation = Task { await finishSession(transcribe: true) }
+    }
+    func toggleRecording() {
+        if phase == .recordingSession { stopSession() }
+        else { startSession() }
     }
     private func captureFailed(_ error: Error) {
         guard activeSession != nil, phase == .recordingSession || phase == .preparing else { return }
@@ -244,5 +248,8 @@ import Foundation
         catch { message = error.localizedDescription }
     }
     func copyLastTranscript() { if let lastTranscript { do { try injector.copy(lastTranscript); message = "Copied last transcript." } catch { message = error.localizedDescription } } }
-    func hotkeyRegistrationFailed(_ error: Error) { hotkeyError = "Could not register ⇧⌘D: \(error.localizedDescription)" }
+    func hotkeyRegistrationFailed(_ error: Error, shortcut: Shortcut) {
+        let failure = "Could not register \(shortcut.label): \(error.localizedDescription)"
+        hotkeyError = hotkeyError.map { "\($0)\n\(failure)" } ?? failure
+    }
 }

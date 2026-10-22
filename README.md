@@ -1,8 +1,9 @@
 # Lalia
 
 Native macOS menu-bar dictation and session recording. Hold Command+Shift+D
-and release to paste a local oMLX/Cohere transcript. Start a session to save
-separate microphone and Mac audio tracks, then transcribe them after Stop.
+and release to paste a local oMLX/Cohere transcript. Press Command+Shift+R to
+toggle recording of separate microphone and Mac audio tracks, then transcribe
+them after Stop.
 
 Requires Apple silicon and macOS 26 or newer. Dictation needs Microphone and
 Accessibility permission. Sessions need Microphone and Screen & System Audio
@@ -42,9 +43,13 @@ and release. `Copy Last Transcript` remains available if pasting fails.
 Clipboard restoration covers eagerly readable pasteboard data. macOS does
 not expose every lazy or promised representation.
 
-Choose `Start Session` to record microphone and Mac audio, then `Stop Session`
-to save and transcribe. Lalia excludes its own playback. Use headphones to
-reduce Mac playback leaking into the microphone.
+Press Command+Shift+R once to start recording microphone and Mac audio, then
+again to stop, save, and transcribe. The menu and history window offer the same
+`Start Recording` / `Stop Recording` button. Recording has no duration limit
+and continues when you release the shortcut. Holding the shortcut does not
+toggle repeatedly. Lalia ignores the toggle while starting, saving, dictating,
+or processing. Lalia excludes its own playback. Use headphones to reduce Mac
+playback leaking into the microphone.
 
 `Recording History` shows saved audio, status, errors, and selectable text.
 `Retry Transcription` processes unfinished jobs and preserves completed
