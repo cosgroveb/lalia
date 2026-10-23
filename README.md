@@ -51,6 +51,11 @@ toggle repeatedly. Lalia ignores the toggle while starting, saving, dictating,
 or processing. Lalia excludes its own playback. Use headphones to reduce Mac
 playback leaking into the microphone.
 
+Lalia keeps the Mac and display awake during session recording because display
+sleep interrupts ScreenCaptureKit audio capture. Stopping, capture failure, or
+quitting releases that hold. Explicit sleep or closing the lid can still
+interrupt recording. Saved audio remains available for retry.
+
 `Recording History` shows saved audio, status, errors, and selectable text.
 `Retry Transcription` processes unfinished jobs and preserves completed
 responses. `Export TXT` exports source-labelled text with approximate times.

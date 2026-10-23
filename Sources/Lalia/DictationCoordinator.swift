@@ -20,6 +20,7 @@ import Foundation
     private var operation: Task<Void, Never>?
     private var quitting = false
     private var startingFailure: Error?
+    private var recordingActivity: RecordingActivity?
     var available: Bool { !quitting && (phase == .idle || phase == .needsPermission) }
     var canCancel: Bool { phase == .transcribing || phase == .summarizing }
 
@@ -101,6 +102,7 @@ import Foundation
                 try Task.checkCancellation()
                 let session = try store.create(kind: .session)
                 activeSession = session.id
+                recordingActivity = RecordingActivity(session: session.id)
                 try await capture.start(session: session.id, store: store) { [weak self] error in
                     self?.captureFailed(error)
                 }
@@ -109,6 +111,7 @@ import Foundation
                     await finishSession(transcribe: false, failure: startingFailure)
                 } else { phase = .recordingSession; message = "Recording microphone and Mac audio…" }
             } catch {
+                recordingActivity = nil
                 recordCaptureFailure(error)
                 activeSession = nil; phase = .idle
             }
@@ -134,6 +137,7 @@ import Foundation
         guard let id = activeSession else { return }
         var failure = failure
         do { try await capture.stop() } catch { if failure == nil { failure = error } }
+        recordingActivity = nil
         if let failure { recordCaptureFailure(failure) }
         else {
             do { try store.update(id) { $0.captureState = .complete } }
@@ -252,4 +256,16 @@ import Foundation
         let failure = "Could not register \(shortcut.label): \(error.localizedDescription)"
         hotkeyError = hotkeyError.map { "\($0)\n\(failure)" } ?? failure
     }
+}
+
+private final class RecordingActivity {
+    private let token: NSObjectProtocol
+    init(session: UUID) {
+        // ScreenCaptureKit also stops audio when its display goes to sleep.
+        token = ProcessInfo.processInfo.beginActivity(
+            options: [.idleDisplaySleepDisabled, .idleSystemSleepDisabled],
+            reason: "Lalia recording \(session.uuidString)"
+        )
+    }
+    deinit { ProcessInfo.processInfo.endActivity(token) }
 }

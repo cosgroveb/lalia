@@ -1,9 +1,32 @@
 import AVFoundation
 import Foundation
+import IOKit.pwr_mgt
 import Testing
 @testable import Lalia
 
 @MainActor struct DictationCoordinatorTests {
+    @Test func sessionPreventsIdleSleepAndReleasesOnEveryExit() async throws {
+        for ending in ["stop", "start failure", "capture failure", "stop failure", "quit"] {
+            let test = CoordinatorFixture()
+            if ending == "start failure" { test.capture.startError = TestError.failed }
+            if ending == "stop failure" { test.capture.stopError = TestError.failed }
+            test.coordinator.startSession()
+            await test.coordinator.waitForOperation()
+            let id = try #require(test.coordinator.sessions.first).id
+            if ending == "start failure" {
+                #expect(try sleepAssertions(for: id).isEmpty)
+                continue
+            }
+            #expect(try sleepAssertions(for: id) == Set(["PreventUserIdleDisplaySleep", "PreventUserIdleSystemSleep"]))
+            switch ending {
+            case "quit": await test.coordinator.shutdown()
+            case "capture failure": test.capture.fail?(TestError.failed)
+            default: test.coordinator.stopSession()
+            }
+            await test.coordinator.waitForOperation()
+            #expect(try sleepAssertions(for: id).isEmpty)
+        }
+    }
     @Test func enablesOfflineAndGatesOverlappingHotkeys() async throws {
         let test = CoordinatorFixture()
         test.transcriber.prepareError = TestError.failed
@@ -227,6 +250,18 @@ import Testing
 
 private enum TestError: LocalizedError { case failed; var errorDescription: String? { "Failed." } }
 
+private func sleepAssertions(for session: UUID) throws -> Set<String> {
+    var assertions: Unmanaged<CFDictionary>?
+    #expect(IOPMCopyAssertionsByProcess(&assertions) == kIOReturnSuccess)
+    let processes = try #require(assertions).takeRetainedValue() as NSDictionary
+    let owned = processes[NSNumber(value: ProcessInfo.processInfo.processIdentifier)] as? [[String: Any]] ?? []
+    return Set(owned.compactMap { entry in
+        guard (entry[kIOPMAssertionNameKey] as? String)?.contains(session.uuidString) == true,
+              (entry[kIOPMAssertionLevelKey] as? Int) == Int(kIOPMAssertionLevelOn) else { return nil }
+        return entry[kIOPMAssertionTypeKey] as? String
+    })
+}
+
 @MainActor private final class CoordinatorFixture {
     let storage = TemporaryStore()
     let recorder = TestRecorder()
@@ -254,6 +289,7 @@ private final class TestRecorder: Recording {
 @MainActor private final class TestCapture: SessionCapturing {
     var startCalls = 0; var stopCalls = 0
     var startError: Error?
+    var stopError: Error?
     var fail: (@MainActor @Sendable (Error) -> Void)?
     var writer: SourceAudioWriter?
     func start(session: UUID, store: SessionStore, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
@@ -262,7 +298,10 @@ private final class TestRecorder: Recording {
         writer = SourceAudioWriter(store: store, session: session, origin: 0)
         try writer?.append(pcm(frames: 48_000), source: .microphone, timestamp: 0)
     }
-    func stop() async throws { stopCalls += 1; try writer?.finish(); writer = nil }
+    func stop() async throws {
+        stopCalls += 1; try writer?.finish(); writer = nil
+        if let stopError { throw stopError }
+    }
 }
 
 @MainActor private final class TestTranscriber: Transcribing {
