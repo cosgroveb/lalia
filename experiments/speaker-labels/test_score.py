@@ -86,6 +86,50 @@ class ScoreTests(unittest.TestCase):
         self.assertFalse(result["schema"]["speaker_output_parsed"])
         self.assertEqual(result["lexical"]["hypothesis_words"], 0)
 
+    def test_silence_event_is_not_a_hallucinated_word(self):
+        clip = {"id": "silence20", "duration": 20, "reference_segments": []}
+        response = {"text": '[{"Start":0,"End":20.0,"Content":"[Silence]"}]',
+                    "segments": [{"start": 0, "end": 20.0, "text": "[Silence]"}]}
+        original = json.dumps(response)
+        result = score(clip, response, True)
+        self.assertEqual(result["lexical"]["insertions"], 0)
+        self.assertEqual(result["schema"]["hypothesis_words"], 0)
+        self.assertEqual(result["schema"]["missing_speaker_count"], 0)
+        self.assertEqual(result["schema"]["non_speech_event_counts"], {"[Silence]": 1})
+        self.assertTrue(result["schema"]["speaker_output_parsed"])
+        self.assertEqual(result["diarization"]["strict"]["false_alarm_speaker_seconds"], 0)
+        self.assertEqual(json.dumps(response), original)
+
+    def test_known_events_do_not_block_valid_speaker_metrics(self):
+        events = ["[Environmental Sounds]", "[Human Sounds]", "[Silence]", "[Music]"]
+        hypothesis = self.reference + [{"start": 0, "end": 10, "text": text} for text in events]
+        result = score(self.clip, {"segments": hypothesis}, True)
+        self.assertEqual(result["lexical"]["wer"], 0)
+        self.assertEqual(result["speaker_attributed"]["cpwer"], 0)
+        self.assertEqual(result["diarization"]["strict"]["der"], 0)
+        self.assertEqual(result["schema"]["non_speech_event_count"], 4)
+        self.assertEqual(result["schema"]["segment_count"], 6)
+        self.assertEqual(result["schema"]["speech_segment_count"], 2)
+
+    def test_event_replacing_reference_speech_remains_missed(self):
+        hypothesis = [self.reference[0], {"start": 4, "end": 6, "text": "[Silence]"}]
+        result = score(self.clip, {"segments": hypothesis}, True)
+        self.assertEqual(result["lexical"]["wer"], 0.5)
+        self.assertEqual(result["lexical"]["deletions"], 2)
+        self.assertEqual(result["speaker_attributed"]["cpwer"], 0.5)
+        self.assertEqual(result["diarization"]["strict"]["der"], 0.5)
+        self.assertEqual(result["diarization"]["strict"]["missed_speaker_seconds"], 2)
+
+    def test_unknown_or_mixed_event_text_still_requires_speaker(self):
+        for text in ("[Noise]", "[Silence] Three four", "Three four"):
+            with self.subTest(text=text):
+                hypothesis = [self.reference[0], {"start": 4, "end": 6, "text": text}]
+                result = score(self.clip, {"segments": hypothesis}, True)
+                self.assertEqual(result["schema"]["non_speech_event_count"], 0)
+                self.assertEqual(result["schema"]["missing_speaker_count"], 1)
+                self.assertIsNone(result["speaker_attributed"])
+                self.assertIsNone(result["diarization"])
+
 
 if __name__ == "__main__":
     unittest.main()

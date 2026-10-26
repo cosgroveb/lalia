@@ -9,7 +9,7 @@ its UEM is the whole clip, with both zero and +/-250 ms boundary collars.
 """
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import importlib.metadata
 import json
 import math
@@ -21,6 +21,9 @@ import jiwer
 from meeteval.wer.wer.cp import cp_word_error_rate
 from pyannote.core import Annotation, Segment, Timeline
 from pyannote.metrics.diarization import DiarizationErrorRate
+
+
+NON_SPEECH_EVENTS = frozenset({"[Environmental Sounds]", "[Human Sounds]", "[Silence]", "[Music]"})
 
 
 def normalize(text):
@@ -96,16 +99,19 @@ def score(clip, response, expect_speakers=False):
         raw_segments = []
     if not isinstance(raw_segments, list):
         raise ValueError("Response segments must be a list")
-    segments = [s for s in raw_segments if isinstance(s, dict) and isinstance(s.get("text"), str)]
+    valid_segments = [s for s in raw_segments if isinstance(s, dict) and isinstance(s.get("text"), str)]
+    # Exact event tags describe non-speech; reference speech remains fully scored.
+    events = Counter(s["text"] for s in valid_segments if s["text"] in NON_SPEECH_EVENTS)
+    segments = [s for s in valid_segments if s["text"] not in NON_SPEECH_EVENTS]
     timed = [s for s in segments if valid_time(s, duration)]
     labeled = [s for s in segments if has_speaker(s)]
     raw_text = response.get("text", "")
     if not isinstance(raw_text, str):
         raise ValueError("Response text must be a string")
-    hypothesis_text = transcript(segments) if segments else normalize(raw_text) if not expect_speakers else ""
+    hypothesis_text = transcript(segments) if valid_segments else normalize(raw_text) if not expect_speakers else ""
     invalid_times = len(segments) - len(timed)
     missing_labels = len(segments) - len(labeled)
-    parsed = bool(segments) or not raw_text.strip()
+    parsed = bool(valid_segments) or not raw_text.strip()
     result = {
         "clip_id": clip.get("id"),
         "audio_seconds": duration,
@@ -113,12 +119,16 @@ def score(clip, response, expect_speakers=False):
         "versions": {name: importlib.metadata.version(name) for name in ("jiwer", "meeteval", "pyannote.metrics")},
         "schema": {
             "segment_count": len(raw_segments),
-            "invalid_segment_count": len(raw_segments) - len(segments),
+            "speech_segment_count": len(segments),
+            "non_speech_event_count": sum(events.values()),
+            "non_speech_event_counts": dict(events),
+            "invalid_segment_count": len(raw_segments) - len(valid_segments),
             "invalid_time_count": invalid_times,
             "missing_speaker_count": missing_labels,
             "speaker_count": len({str(s["speaker_id"]) for s in labeled}),
             "speaker_output_parsed": parsed if expect_speakers else None,
-            "last_segment_end": max((s["end"] for s in timed), default=None),
+            "last_segment_end": max((s["end"] for s in valid_segments if valid_time(s, duration)), default=None),
+            "last_speech_end": max((s["end"] for s in timed), default=None),
             "hypothesis_words": len(hypothesis_text.split()),
         },
         "lexical": None,
@@ -137,7 +147,7 @@ def score(clip, response, expect_speakers=False):
     if not expect_speakers:
         result["speaker_metric_unavailable_reason"] = "Transcription-only baseline"
         return result
-    if missing_labels or len(raw_segments) != len(segments):
+    if missing_labels or len(raw_segments) != len(valid_segments):
         result["speaker_metric_unavailable_reason"] = "Malformed or unlabeled output segments"
         return result
     ref_groups, hyp_groups = by_speaker(reference), by_speaker(segments)

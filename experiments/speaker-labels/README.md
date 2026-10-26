@@ -62,7 +62,9 @@ whole speaker transcripts under the best label permutation. DER includes
 overlap and reports zero collar plus a ±250 ms boundary tolerance. Plain WER
 depends on word order during overlapping speech. Sentence-level model times
 and manual speech-turn boundaries also differ, so inspect cpWER and DER
-together. Scoring tests cover label permutation, merged speakers, missing
+together. Known non-speech event tags are excluded from hypothesis speech.
+Reference speech under those events still counts as missed speech. Scoring
+tests cover label permutation, merged speakers, non-speech events, missing
 output, invalid times, overlap, silence and privacy.
 
 HTTP completion does not establish usable speaker output. Check schema
