@@ -44,6 +44,51 @@ Use `--deadline` with a Unix timestamp for an overall cutoff. Existing result
 files are skipped, including failures. Preserve failed attempts elsewhere
 before rerunning them.
 
+## Qualify capped recordings
+
+Use an isolated copy of oMLX 0.7.2 with the JSON usage patch from the dotfiles
+installer. Keep production oMLX running. Point `--omlx` at a launcher that
+sets `PYTHONPATH` to that copy before invoking the installed oMLX Python.
+The patcher accepts `--site-packages` and `--backup-dir` for isolated copies.
+Those options never restart Homebrew.
+
+Prepare repeated public fixtures with `prepare_public.py --output "$state/data/public"
+--stress-minutes 60 90`. Each fixture ends with the source meeting's tail and
+retains shifted references. These test capacity and continuity, using repeated
+audio rather than independent accuracy samples.
+
+Supply `--prompt-file /path/to/official-moss-prompt.txt` for both baseline and
+long requests. Use the exact `SessionTranscriptionProfile.officialPrompt`
+from `Sources/Lalia/SpeakerTranscript.swift`: 222 UTF-8 bytes, no added newline,
+SHA-256 `5696a90762c9a738598bdf62530952cb9058f0bd2da8dccc23d988b68990e22a`.
+The runner sends literal multipart text and records the prompt, source path
+and hash. The patched signature adapter must forward it to MOSS. The English
+backend default stopped early in two hour-long tests.
+
+Run the full 17-minute meeting first with `--qualify --max-tokens 49152` and
+that prompt file.
+Run each long fixture with the same options plus `--baseline` pointing to
+that fresh result's `result.json`. Qualification requires actual token usage,
+EOS below the requested ceiling, complete raw/structured coverage, valid
+overlapping timestamps, four global speakers, final speech and no more than
+five percentage points of cpWER or collared DER regression. It reports
+matched-passage timestamp error near the beginning, middle and end and checks
+speaker assignment across repeated sections. An exhausted response permits
+one diagnostic at 57344 tokens. Do not retry with a larger ceiling for other
+failures or add production escalation.
+
+Stress, repeated and hour-long fixtures require a completed, accepted short
+MOSS baseline with finite cpWER and collared DER and identical recorded prompt
+text and hash. Missing, invalid or archived baselines without prompt metadata
+stop the runner before it starts children. Short calibration may omit one.
+
+The runner records swap before and after each request. A cancelled client can
+leave the server decoding, so the runner stops and waits for its owned server
+on failure or exit. Production Lalia can only abandon the result. Verify the
+isolated port closes before starting another run.
+At 25% charge on battery power, the runner stops the whole batch and waits for
+its client, server and awake assertion. AC power does not trigger this cutoff.
+
 Results contain raw local responses, aggregate scores and memory samples.
 `summary.json` and `REPORT.md` contain aggregates only. HTTP timing excludes
 server startup, which has its own field. Physical footprint is sampled every
@@ -75,6 +120,13 @@ already skips exact digital silence before inference.
 
 One headset-mix meeting cannot establish accuracy on ambient MacBook audio.
 Training-set overlap is unknown. Scores describe these installed model/runtime
-combinations, not a general model ranking. Lalia still needs persistent speaker
-IDs, overlap handling and a longer token budget before these responses can
-become a session feature.
+combinations, not a general model ranking. Deployment still requires long-request
+and real two-track qualification.
+
+The October 26 actual-API test with the exact official prompt passed its
+17-minute baseline (12.44% cpWER, 15.32% collared DER). Its 90-minute request
+failed: native EOS after 17,127 output tokens despite a 49,152 ceiling, last
+parsed speech at 36m49s, 65.70% cpWER and 66.22% collared DER. It took 476.03s
+at 23.94 GiB peak footprint, with unchanged swap. A separate 60-minute prompt
+diagnostic succeeded, but does not qualify the 90-minute path. Deployment,
+real-device testing and coding-model contention checks remain on hold.

@@ -50,10 +50,70 @@ private final class HTTPFixture: URLProtocol, @unchecked Sendable {
         let bytes = try Data(contentsOf: body)
         #expect(bytes.range(of: Data("name=\"max_tokens\"\r\n\r\n1024\r\n".utf8)) != nil)
         #expect(bytes.range(of: Data("name=\"language\"\r\n\r\nen\r\n".utf8)) != nil)
+        #expect(bytes.range(of: Data("name=\"prompt\"".utf8)) == nil)
         #expect(bytes.range(of: Data("cohere-transcribe-03-2026".utf8)) != nil)
         #expect(bytes.range(of: try Data(contentsOf: audio)) != nil)
         #expect(bytes.suffix(21) == Data("\r\n--test-boundary--\r\n".utf8).suffix(21))
         #expect(try FileManager.default.attributesOfItem(atPath: body.path)[.posixPermissions] as? Int == 0o600)
+    }
+    @Test func sessionConfigDefaultsAndProfileRemainIndependentOfDictation() async throws {
+        let old = #"{"baseURL":"http://127.0.0.1:8000/v1","transcriptionModel":"cohere","language":"en","summaryModel":"notes"}"#
+        let decoded = try JSONDecoder().decode(OMLXConfiguration.self, from: Data(old.utf8))
+        #expect(decoded.sessionTranscriptionModel == "MOSS-Transcribe-Diarize")
+        let missing = client(body: #"{"data":[{"id":"cohere-transcribe-03-2026"}]}"#)
+        await #expect(throws: Error.self) { try await missing.prepareSession(profile: missing.sessionProfile()) }
+        let ready = client(body: #"{"data":[{"id":"MOSS-Transcribe-Diarize"}]}"#)
+        let profile = try ready.sessionProfile()
+        try await ready.prepareSession(profile: profile)
+        #expect(profile.maximumTokens == 49_152)
+        #expect(profile.maximumUploadBytes == 250_000_000)
+        #expect(profile.timeout == 2_400)
+        #expect(profile.prompt == SessionTranscriptionProfile.officialPrompt)
+        let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)
+        let file = try fixture.store.file(record.id, record.segments[0].filename)
+        let body = try OMLXClient.multipart(file: file, configuration: .init(transcriptionModel: profile.model), boundary: "session",
+            maximumBytes: profile.maximumUploadBytes, maximumTokens: profile.maximumTokens, prompt: profile.prompt)
+        defer { try? FileManager.default.removeItem(at: body) }
+        let bytes = try Data(contentsOf: body)
+        #expect(bytes.range(of: Data("name=\"max_tokens\"\r\n\r\n49152\r\n".utf8)) != nil)
+        #expect(bytes.range(of: Data("MOSS-Transcribe-Diarize".utf8)) != nil)
+        #expect(bytes.range(of: Data("name=\"prompt\"\r\n\r\n\(SessionTranscriptionProfile.officialPrompt)\r\n".utf8)) != nil)
+    }
+    @Test func savedProfileWithoutPromptKeepsBackendDefault() throws {
+        let old = #"{"baseURL":"http://127.0.0.1:8000/v1","model":"MOSS-Transcribe-Diarize","language":"en","maximumTokens":49152,"contextTokens":131072,"maximumUploadBytes":250000000,"timeout":2400}"#
+        let profile = try JSONDecoder().decode(SessionTranscriptionProfile.self, from: Data(old.utf8))
+        try profile.validate()
+        #expect(profile.prompt == nil)
+        #expect(try JSONDecoder().decode(SessionTranscriptionProfile.self, from: JSONEncoder().encode(profile)).prompt == nil)
+        let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)
+        let body = try OMLXClient.multipart(file: fixture.store.file(record.id, record.segments[0].filename),
+            configuration: .init(transcriptionModel: profile.model), boundary: "old-session", prompt: profile.prompt)
+        defer { try? FileManager.default.removeItem(at: body) }
+        #expect(try Data(contentsOf: body).range(of: Data("name=\"prompt\"".utf8)) == nil)
+    }
+    @Test func retainsSessionRawResponseAndFrozenTimeout() async throws {
+        let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)
+        let client = client(body: "{malformed diagnostic")
+        var profile = try client.sessionProfile(); profile.baseURL = "http://localhost:9999/v1"; profile.timeout = 321
+        let raw = try await client.transcribeSession(fixture.store.file(record.id, record.segments[0].filename), profile: profile)
+        #expect(raw == Data("{malformed diagnostic".utf8))
+        let request = HTTPFixture.state.withLock { $0.request }
+        #expect(request?.url?.port == 9999)
+        #expect(request?.timeoutInterval == 321)
+        var invalid = profile; invalid.maximumTokens = 131_072
+        #expect(throws: Error.self) { try invalid.validate() }
+    }
+    @Test func sessionUploadRejectsAboveItsBoundBeforeBuildingMultipart() throws {
+        let fixture = TemporaryStore(); let record = try fixture.store.create(kind: .session)
+        let file = try fixture.store.file(record.id, "oversized.wav")
+        try fixture.store.privateFile(file)
+        let handle = try FileHandle(forWritingTo: file)
+        try handle.truncate(atOffset: 250_000_001)
+        try handle.close()
+        #expect(throws: Error.self) {
+            try OMLXClient.multipart(file: file, configuration: .init(transcriptionModel: "MOSS-Transcribe-Diarize"),
+                boundary: "large", maximumBytes: 250_000_000, maximumTokens: 49_152)
+        }
     }
     @Test func decodesResponsesWithoutUsingComputeDuration() async throws {
         let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)

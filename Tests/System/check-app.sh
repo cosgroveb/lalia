@@ -28,7 +28,9 @@ codesign --verify --deep --strict "$app"
 python3 Tests/System/check-http.py "$app/Contents/MacOS/Lalia"
 if [[ ${LALIA_LIVE_ASR:-0} == 1 ]]; then
   : "${LALIA_ASR_FIXTURE:?set LALIA_ASR_FIXTURE to a speech recording for the live check}"
-  "$app/Contents/MacOS/Lalia" --transcribe-file "$LALIA_ASR_FIXTURE"
+  mode=--transcribe-file
+  if [[ ${LALIA_SESSION_ASR:-0} == 1 ]]; then mode=--transcribe-session-file; fi
+  "$app/Contents/MacOS/Lalia" "$mode" "$LALIA_ASR_FIXTURE"
 else
   echo 'Live ASR not run. Set LALIA_LIVE_ASR=1 and LALIA_ASR_FIXTURE to request it.'
 fi

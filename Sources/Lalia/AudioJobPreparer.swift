@@ -65,7 +65,7 @@ struct AudioJobPreparer: Sendable {
 
     // One converter spans contiguous storage files. Its end-of-stream pass drains
     // the resampling tail before any request boundaries are chosen.
-    private func normalize(_ segments: [AudioSegment], session: UUID, store: SessionStore, to destination: URL) throws {
+    func normalize(_ segments: [AudioSegment], session: UUID, store: SessionStore, to destination: URL) throws {
         let urls = try segments.map { try store.file(session, $0.filename) }
         for (segment, url) in zip(segments, urls) {
             let file = try AVAudioFile(forReading: url)

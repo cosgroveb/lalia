@@ -4,7 +4,7 @@ import Foundation
 struct SessionRecord: Codable, Identifiable, Sendable {
     enum Kind: String, Codable { case dictation, session }
     enum CaptureState: String, Codable { case recording, complete, interrupted, failed }
-    var schemaVersion = 1
+    var schemaVersion = 2
     var id: UUID
     var kind: Kind
     var createdAt: Date
@@ -16,12 +16,24 @@ struct SessionRecord: Codable, Identifiable, Sendable {
     var transcriptionError: String?
     var notes: String?
     var notesError: String?
-    var transcriptionComplete: Bool { jobsPrepared && segments.allSatisfy { $0.complete } && jobs.allSatisfy { $0.state == .complete || $0.state == .silence } }
+    var notesRevision: UUID?
+    var analysis: SessionAnalysis?
+    var endedAtLimit: Bool?
+    var notesStale: Bool { notes != nil && notesRevision != analysis?.active?.revision }
+    var transcriptionComplete: Bool {
+        if analysis?.active != nil { return segments.allSatisfy { $0.complete } }
+        return legacyTranscriptionComplete
+    }
+    private var legacyTranscriptionComplete: Bool {
+        jobsPrepared && segments.allSatisfy { $0.complete } && jobs.allSatisfy { $0.state == .complete || $0.state == .silence }
+    }
+    var hasLegacyTranscript: Bool { legacyTranscriptionComplete || !blocks.isEmpty }
     var duration: Double { segments.map { $0.start + $0.duration }.max() ?? 0 }
     var transcript: String {
-        blocks.map { "[\(Self.timestamp($0.start))–\(Self.timestamp($0.end))] \($0.source.label) (approximate)\n\($0.text)" }.joined(separator: "\n\n")
+        if let active = analysis?.active { return active.transcript }
+        return blocks.map { "[\(Self.timestamp($0.start))–\(Self.timestamp($0.end))] \($0.source.label) (approximate)\n\($0.text)" }.joined(separator: "\n\n")
     }
-    var plainTranscript: String { blocks.map(\.text).joined(separator: " ") }
+    var plainTranscript: String { analysis?.active?.transcript ?? blocks.map(\.text).joined(separator: " ") }
     struct Block { var source: AudioSource; var start: Double; var end: Double; var text: String }
     var blocks: [Block] {
         jobs.flatMap { job -> [Block] in
@@ -119,7 +131,7 @@ final class SessionStore: @unchecked Sendable {
     func read(_ id: UUID) throws -> SessionRecord {
         lock.lock(); defer { lock.unlock() }
         let record = try JSONDecoder().decode(SessionRecord.self, from: Data(contentsOf: file(id, "session.json")))
-        guard record.schemaVersion == 1, record.id == id else { throw LaliaError("Unsupported or mismatched session manifest.") }
+        guard [1, 2].contains(record.schemaVersion), record.id == id else { throw LaliaError("Unsupported or mismatched session manifest.") }
         for segment in record.segments {
             _ = try file(id, segment.filename)
             _ = try file(id, segment.partialFilename)
@@ -136,6 +148,22 @@ final class SessionStore: @unchecked Sendable {
         }
         guard Set(record.segments.map(\.id)).count == record.segments.count,
               Set(record.jobs.map(\.id)).count == record.jobs.count else { throw LaliaError("Duplicate session identifiers.") }
+        if let analysis = record.analysis {
+            if let input = analysis.input {
+                _ = try file(id, input.filename)
+                guard input.frames > 0, input.frames <= Int64(SessionTranscriptionProfile.maximumDuration * 16_000) else { throw LaliaError("Invalid mixed audio metadata.") }
+            }
+            if let attempt = analysis.attempt { try attempt.profile.validate() }
+            let duration = analysis.input?.duration ?? record.duration
+            if let active = analysis.active { try active.validate(duration: duration, silence: analysis.input?.silence == true) }
+            if let previous = analysis.previous { try previous.validate(duration: duration, silence: analysis.input?.silence == true) }
+            if analysis.attempt?.state == .complete, analysis.active?.id != analysis.attempt?.id {
+                throw LaliaError("Completed analysis has no matching transcript.")
+            }
+            if analysis.previousIsLegacy == true, analysis.previous != nil || !record.hasLegacyTranscript {
+                throw LaliaError("Previous source transcript is unavailable or ambiguous.")
+            }
+        }
         return record
     }
 
@@ -155,6 +183,14 @@ final class SessionStore: @unchecked Sendable {
     }
 
     private func save(_ record: SessionRecord) throws {
+        var record = record
+        if record.schemaVersion == 1 {
+            let backup = try file(record.id, "session-v1.backup.json")
+            if !manager.fileExists(atPath: backup.path) {
+                try write(Data(contentsOf: file(record.id, "session.json")), to: backup)
+            }
+            record.schemaVersion = 2
+        }
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         try write(encoder.encode(record), to: file(record.id, "session.json"))
@@ -193,6 +229,7 @@ final class SessionStore: @unchecked Sendable {
             record.segments[index].error = nil
             if !segment.complete {
                 record.jobsPrepared = false
+                record.analysis?.input = nil
                 if record.notes != nil { record.notesError = "Recovered audio changed the transcript. Generate notes again after transcription." }
             }
         }
@@ -238,6 +275,41 @@ final class SessionStore: @unchecked Sendable {
             for index in record.jobs.indices where record.jobs[index].state == .running {
                 record.jobs[index].state = .pending
             }
+            if record.analysis?.attempt?.state == .running || record.analysis?.attempt?.state == .preparing {
+                let failure = "Analysis was interrupted. Saved audio and previous transcript are retained. Retry may wait for an earlier oMLX request."
+                record.analysis?.attempt?.state = .failed
+                record.analysis?.attempt?.error = failure
+                record.transcriptionError = failure
+            }
+        }
+    }
+
+    func editTranscript(_ id: UUID, _ edit: (inout SpeakerTranscript) throws -> Void) throws {
+        try update(id) { record in
+            guard var active = record.analysis?.active else { throw LaliaError("No speaker transcript is available.") }
+            try edit(&active)
+            try active.validate(duration: record.analysis?.input?.duration ?? record.duration, silence: record.analysis?.input?.silence == true)
+            record.analysis?.active = active
+        }
+    }
+
+    func restoreTranscript(_ id: UUID) throws {
+        try update(id) { record in
+            guard var analysis = record.analysis else { throw LaliaError("No previous transcript is available.") }
+            let active = analysis.active
+            if analysis.previousIsLegacy == true {
+                analysis.active = nil
+                analysis.previous = active
+                analysis.previousIsLegacy = false
+            } else if let previous = analysis.previous {
+                analysis.active = previous
+                analysis.previous = active
+                analysis.previousIsLegacy = active == nil && record.hasLegacyTranscript
+            } else { throw LaliaError("No previous transcript is available.") }
+            // Restoring selects an older result and clears the latest attempt status.
+            analysis.attempt = nil
+            record.analysis = analysis
+            record.transcriptionError = nil
         }
     }
 

@@ -15,21 +15,25 @@ final class SourceAudioWriter {
     private let session: UUID
     private let origin: Double
     private let rotation: Double
+    private let maximumDuration: Double
     private var tracks: [AudioSource: Track] = [:]
 
-    init(store: SessionStore, session: UUID, origin: Double, rotation: Double = 60) {
+    init(store: SessionStore, session: UUID, origin: Double, rotation: Double = 60, maximumDuration: Double = SessionTranscriptionProfile.maximumDuration) {
         self.store = store; self.session = session; self.origin = origin; self.rotation = rotation
+        self.maximumDuration = maximumDuration
     }
 
     func append(_ buffer: AVAudioPCMBuffer, source: AudioSource, timestamp: Double) throws {
         guard buffer.frameLength > 0 else { return }
         let start = timestamp - origin
         guard start.isFinite, start >= 0, buffer.format.sampleRate > 0 else { throw LaliaError("Invalid capture timestamp or audio format.") }
+        guard start < maximumDuration else { return }
+        let length = min(Int64(buffer.frameLength), Int64(((maximumDuration - start) * buffer.format.sampleRate).rounded(.down)))
         if let track = tracks[source], (!track.format.isEqual(buffer.format) || abs(track.end - start) > 1.5 / buffer.format.sampleRate) {
             try finish(source)
         }
         var offset: AVAudioFrameCount = 0
-        while offset < buffer.frameLength {
+        while offset < length {
             if tracks[source] == nil {
                 let id = UUID()
                 let segment = AudioSegment(id: id, source: source, filename: "\(source.rawValue)-\(id).caf",
@@ -46,7 +50,9 @@ final class SourceAudioWriter {
             }
             guard var track = tracks[source], let file = track.file else { throw LaliaError("Capture file is unavailable.") }
             let room = Int64((rotation * buffer.format.sampleRate).rounded()) - track.frames
-            let count = min(buffer.frameLength - offset, AVAudioFrameCount(room))
+            let remaining = Int64(((maximumDuration - track.end) * buffer.format.sampleRate).rounded(.down))
+            guard remaining > 0 else { break }
+            let count = AVAudioFrameCount(min(length - Int64(offset), room, remaining))
             let part = try Self.slice(buffer, offset: offset, count: count)
             try file.write(from: part)
             track.frames += Int64(count)
@@ -128,7 +134,7 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
 @MainActor final class SessionCapture: SessionCapturing {
     private var stream: SCStream?
     private var output: CaptureOutput?
-    func start(session: UUID, store: SessionStore, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
+    func start(session: UUID, store: SessionStore, maximumDuration: Double, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
         guard let display = content.displays.first else { throw LaliaError("Mac audio capture requires an available display.") }
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
@@ -138,7 +144,7 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
         config.excludesCurrentProcessAudio = true
         config.sampleRate = 48_000
         config.channelCount = 2
-        let writer = SourceAudioWriter(store: store, session: session, origin: CMClockGetTime(CMClockGetHostTimeClock()).seconds)
+        let writer = SourceAudioWriter(store: store, session: session, origin: CMClockGetTime(CMClockGetHostTimeClock()).seconds, maximumDuration: maximumDuration)
         let output = CaptureOutput(writer: writer, failed: failed)
         let stream = SCStream(filter: filter, configuration: config, delegate: output)
         try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: output.queue)

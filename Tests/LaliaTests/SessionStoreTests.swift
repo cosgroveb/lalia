@@ -4,6 +4,90 @@ import Testing
 @testable import Lalia
 
 struct SessionStoreTests {
+    @Test func interruptedAnalysisRecoverySurfacesRetryReasonInHistory() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        for state: SessionAnalysis.Attempt.State in [.preparing, .running] {
+            let record = try savedAudio(store, seconds: 2)
+            let active = try SpeakerTranscript(attempt: speakerAttempt(), duration: 2)
+            try store.update(record.id) {
+                $0.analysis = SessionAnalysis(attempt: .init(profile: active.profile, state: state), active: active)
+            }
+            let recovered = try store.history(recover: true).records.first { $0.id == record.id }
+            #expect(recovered?.analysis?.attempt?.state == .failed)
+            #expect(recovered?.transcriptionError == recovered?.analysis?.attempt?.error)
+            #expect(recovered?.transcriptionError?.contains("interrupted") == true)
+            #expect(recovered?.transcript == active.transcript)
+        }
+    }
+    @Test func restoringTranscriptClearsFailedReplacementError() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let record = try savedAudio(store, seconds: 2)
+        let previous = try SpeakerTranscript(attempt: speakerAttempt(), duration: 2)
+        let active = try SpeakerTranscript(attempt: speakerAttempt(), duration: 2)
+        try store.update(record.id) {
+            $0.analysis = SessionAnalysis(attempt: .init(profile: active.profile, state: .failed, error: "replacement failed"), active: active, previous: previous)
+            $0.transcriptionError = "replacement failed"
+            $0.captureError = "retained capture warning"
+        }
+        try store.restoreTranscript(record.id)
+        let restored = try store.read(record.id)
+        #expect(restored.analysis?.active?.id == previous.id)
+        #expect(restored.analysis?.attempt == nil)
+        #expect(restored.transcriptionError == nil)
+        #expect(restored.captureError == "retained capture warning")
+    }
+    @Test func migratesSchemaOneOnWriteWithPrivateOriginalBackup() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        var record = try savedAudio(store)
+        record.schemaVersion = 1
+        let original = try JSONEncoder().encode(record)
+        try store.write(original, to: store.file(record.id, "session.json"))
+        #expect(try store.read(record.id).schemaVersion == 1)
+        #expect(!FileManager.default.fileExists(atPath: try store.file(record.id, "session-v1.backup.json").path))
+        try store.update(record.id) { $0.notes = "preserved" }
+        #expect(try store.read(record.id).schemaVersion == 2)
+        let backup = try store.file(record.id, "session-v1.backup.json")
+        #expect(try Data(contentsOf: backup) == original)
+        #expect(try FileManager.default.attributesOfItem(atPath: backup.path)[.posixPermissions] as? Int == 0o600)
+        try store.update(record.id) { $0.notes = "changed" }
+        #expect(try Data(contentsOf: backup) == original)
+    }
+    @Test func preservesCorrectionsDuringFailureRecoveryRestoreAndExport() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let record = try savedAudio(store, seconds: 2)
+        let input = try SessionAudioPreparer().prepare(session: record.id, store: store)
+        let attempt = try speakerAttempt()
+        let accepted = try SpeakerTranscript(attempt: attempt, duration: input.duration)
+        try store.update(record.id) { $0.analysis?.active = accepted; $0.notes = "notes"; $0.notesRevision = accepted.revision }
+        try store.editTranscript(record.id) { try $0.rename("S01", to: "Brian") }
+        let corrected = try store.read(record.id)
+        #expect(corrected.notesStale)
+        let before = corrected.transcript
+        try store.update(record.id) { $0.analysis?.attempt = SessionAnalysis.Attempt(profile: attempt.profile, state: .running) }
+        let recovered = try store.recover(record.id)
+        #expect(recovered.analysis?.attempt?.state == .failed)
+        #expect(recovered.transcript == before)
+        let replacement = try SpeakerTranscript(attempt: speakerAttempt(), duration: input.duration)
+        try store.update(record.id) { $0.analysis?.previous = corrected.analysis?.active; $0.analysis?.active = replacement }
+        try store.restoreTranscript(record.id)
+        let reopened = try SessionStore(root: store.root).read(record.id)
+        #expect(reopened.transcript == before)
+        #expect(reopened.analysis?.active?.turns.map(\.id) == accepted.turns.map(\.id))
+        #expect(reopened.notes == "notes")
+        let output = store.root.appending(path: "speakers.txt")
+        try store.export(record.id, to: output)
+        #expect(try String(contentsOf: output, encoding: .utf8) == before)
+        try store.update(record.id) { $0.analysis?.input?.filename = "../outside.wav" }
+        #expect(throws: Error.self) { try store.read(record.id) }
+    }
+    @Test func rejectsBrokenTurnCorrectionReferences() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let record = try savedAudio(store, seconds: 2)
+        let accepted = try SpeakerTranscript(attempt: speakerAttempt(), duration: 2)
+        try store.update(record.id) { $0.analysis = SessionAnalysis(active: accepted) }
+        #expect(throws: Error.self) { try store.editTranscript(record.id) { $0.assignments[UUID().uuidString] = "S01" } }
+        #expect(try store.read(record.id).analysis?.active?.assignments.isEmpty == true)
+    }
     @Test func rejectsUnrepresentableTimesWithoutRemovingRecordings() throws {
         let fixture = TemporaryStore(); let store = fixture.store
         for invalid in ["source start", "source duration", "source end", "job start", "job end"] {

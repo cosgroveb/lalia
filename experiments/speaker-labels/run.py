@@ -3,9 +3,11 @@
 import argparse
 import ctypes
 import datetime as dt
+import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -15,11 +17,16 @@ import urllib.error
 import urllib.request
 
 from score import score
+from qualification import acceptance, baseline_metrics, completion
 
 
 GIB = 1024**3
 MODELS = ["cohere-transcribe-03-2026", "MOSS-Transcribe-Diarize", "VibeVoice-ASR-bf16"]
 LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib")
+
+
+class BatteryLimitError(Exception):
+    pass
 
 
 def footprint(pid):
@@ -92,18 +99,20 @@ def start_server(args, model):
 
 
 def transcribe(args, server, model, clip, directory):
-    tokens = 1024 if model.startswith("cohere") else (8192 if clip["duration"] <= 180 else 32768)
+    tokens = args.max_tokens or (1024 if model.startswith("cohere") else (8192 if clip["duration"] <= 180 else 49152))
     timeout = args.timeout
     if args.deadline:
         timeout = min(timeout, max(1, args.deadline - time.time()))
     command = [
-        "curl", "--silent", "--show-error", "--fail-with-body", "--max-time", str(timeout),
+        "curl", "--silent", "--show-error", "--fail-with-body", "--noproxy", "*", "--max-time", str(timeout),
         f"http://127.0.0.1:{args.port}/v1/audio/transcriptions",
         "--form", f"file=@{clip['audio_path']}", "--form", f"model={model}",
         "--form", "language=en", "--form", "stream=false", "--form", f"max_tokens={tokens}",
         "--output", str(directory / "response.json"),
         "--write-out", "%{time_total}\n",
     ]
+    if args.prompt is not None:
+        command.extend(["--form-string", f"prompt={args.prompt}"])
     started = time.monotonic()
     measurements = []
     with (directory / "client.log").open("w") as log, (directory / "http-seconds.txt").open("w") as timing:
@@ -118,17 +127,32 @@ def transcribe(args, server, model, clip, directory):
                     raise MemoryError(f"Server exceeded {args.memory_gib}GiB physical footprint")
                 if time.monotonic() - started > timeout + 5:
                     raise TimeoutError("Request exceeded deadline")
+                if len(measurements) % 20 == 1:
+                    power = subprocess.run(["pmset", "-g", "batt"], check=True, capture_output=True, text=True).stdout
+                    percent = re.search(r"(\d+)%", power)
+                    if "Battery Power" in power and percent and int(percent[1]) <= args.min_battery_percent:
+                        raise BatteryLimitError(f"Battery reached {args.min_battery_percent}%, connect power before retrying")
                 time.sleep(0.5)
             if request.returncode:
                 raise RuntimeError(f"HTTP client exited {request.returncode}. See local response/client log")
             elapsed = float((directory / "http-seconds.txt").read_text().strip())
             response = json.loads((directory / "response.json").read_text())
             metrics = score(clip, response, expect_speakers=not model.startswith("cohere"))
-            return {
+            result = {
                 "status": "complete", "wall_seconds": elapsed,
                 "real_time_factor": elapsed / clip["duration"],
                 "max_tokens": tokens, "metrics": metrics,
             }
+            if args.qualify:
+                try:
+                    result["completion"] = completion(response, clip["duration"], tokens)
+                except ValueError as error:
+                    result.update(status="rejected", error=str(error), usage=response.get("usage"))
+                    return result
+                result["qualification"] = acceptance(clip, response, metrics, args.baseline, args.prompt)
+                if not result["qualification"]["accepted"]:
+                    result["status"] = "rejected"
+            return result
         finally:
             stop(request)
             save(directory / "memory.json", measurements)
@@ -156,11 +180,25 @@ def main():
     parser.add_argument("--port", type=int, default=18001)
     parser.add_argument("--timeout", type=int, default=2400)
     parser.add_argument("--memory-gib", type=float, default=64)
+    parser.add_argument("--min-battery-percent", type=int, default=25)
+    parser.add_argument("--max-tokens", type=int)
+    parser.add_argument("--prompt-file", type=Path, help="UTF-8 prompt sent literally, including whitespace, and recorded with its SHA-256")
+    parser.add_argument("--qualify", action="store_true", help="Require MOSS usage, raw coverage and reference acceptance")
+    parser.add_argument("--baseline", type=Path, help="Fresh short MOSS result.json for the 5pp regression check")
     parser.add_argument("--deadline", type=float, help="Unix timestamp, stop starting requests after this time")
     args = parser.parse_args()
     os.umask(0o077)
     signal.signal(signal.SIGTERM, interrupt)
     args.state = args.state.resolve()
+    args.prompt = None
+    prompt_sha256 = None
+    if args.prompt_file is not None:
+        args.prompt_file = args.prompt_file.resolve(strict=True)
+        prompt_bytes = args.prompt_file.read_bytes()
+        args.prompt = prompt_bytes.decode("utf-8")
+        if not args.prompt.strip():
+            raise ValueError("Prompt file must contain a nonempty instruction")
+        prompt_sha256 = hashlib.sha256(prompt_bytes).hexdigest()
     clips = []
     for manifest in args.manifest:
         document = json.loads(manifest.read_text())
@@ -169,7 +207,16 @@ def main():
         clips = [clip for clip in clips if clip["id"] in args.clips]
     if not clips:
         raise ValueError("No clips selected")
+    if args.baseline is not None:
+        args.baseline = json.loads(args.baseline.read_text())
+        if not isinstance(args.baseline, dict):
+            raise ValueError("Invalid baseline result")
+    if args.qualify:
+        for clip in clips:
+            baseline_metrics(clip, args.baseline, args.prompt)
     save(args.state / "runner-process.json", {"pid": os.getpid(), "started_at": dt.datetime.now().astimezone().isoformat()})
+    awake = subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())], start_new_session=True)
+    save(args.state / "awake-process.json", {"pid": awake.pid})
     server = None
     try:
         for model in args.models:
@@ -178,13 +225,20 @@ def main():
                     directory = args.state / "results" / model / clip["id"]
                     directory.mkdir(parents=True, exist_ok=True)
                     if (directory / "result.json").exists():
+                        previous = json.loads((directory / "result.json").read_text())
+                        if (previous.get("prompt") != args.prompt or previous.get("prompt_sha256") != prompt_sha256
+                                or (args.qualify and "prompt" not in previous)):
+                            raise ValueError("Saved result uses a different or unrecorded prompt; use a new state directory")
                         continue
                     if args.deadline and time.time() >= args.deadline:
                         raise TimeoutError("Experiment deadline reached")
                     print(f"Running {model} / {clip['id']}", flush=True)
                     row = {"model": model, "clip": clip["id"], "audio_seconds": clip["duration"],
                            "private": clip.get("private", False), "started_at": dt.datetime.now().astimezone().isoformat(),
-                           "cold_load": server is None}
+                           "cold_load": server is None, "prompt": args.prompt,
+                           "prompt_source": str(args.prompt_file) if args.prompt_file else None,
+                           "prompt_sha256": prompt_sha256}
+                    row["swap_before"] = subprocess.run(["sysctl", "vm.swapusage"], check=True, capture_output=True, text=True).stdout.strip()
                     save(args.state / "progress.json", {**row, "status": "running"})
                     try:
                         if server is None:
@@ -206,6 +260,7 @@ def main():
                     memory = directory / "memory.json"
                     if memory.exists():
                         row["peak_footprint_gib"] = max((m["footprint_bytes"] for m in json.loads(memory.read_text())), default=0) / GIB
+                    row["swap_after"] = subprocess.run(["sysctl", "vm.swapusage"], check=True, capture_output=True, text=True).stdout.strip()
                     save(directory / "result.json", row)
                     report(args.state)
             finally:
@@ -219,6 +274,7 @@ def main():
     finally:
         if server is not None:
             stop(server)
+        stop(awake)
         report(args.state)
 
 

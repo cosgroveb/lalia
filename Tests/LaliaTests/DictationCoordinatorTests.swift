@@ -4,7 +4,202 @@ import IOKit.pwr_mgt
 import Testing
 @testable import Lalia
 
-@MainActor struct DictationCoordinatorTests {
+@Suite(.serialized) @MainActor struct DictationCoordinatorTests {
+    @Test func stopsPlaybackSynchronouslyBeforeEitherCaptureStarts() async throws {
+        for session in [false, true] {
+            let test = CoordinatorFixture()
+            let events = PlaybackCaptureEvents()
+            test.playback.onStop = { events.values.append("stop playback") }
+            test.recorder.onStart = { events.values.append("start dictation") }
+            test.capture.onStart = { events.values.append("start session") }
+            if session {
+                test.coordinator.startSession()
+                await test.coordinator.waitForOperation()
+            } else {
+                await test.coordinator.enableDictation()
+                test.coordinator.hotkeyPressed()
+            }
+            #expect(events.values == ["stop playback", session ? "start session" : "start dictation"])
+            await test.coordinator.shutdown()
+        }
+    }
+    @Test func firstSpeakerUpgradeCanRestoreLegacyTranscriptAndToggleBack() async throws {
+        let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)
+        try AudioJobPreparer().prepare(session: saved.id, store: test.storage.store)
+        try test.storage.store.update(saved.id) {
+            $0.jobs[0].state = .complete; $0.jobs[0].response = Transcription(text: "original source transcript")
+        }
+        let legacy = try test.storage.store.read(saved.id).transcript
+        test.coordinator.reprocess(saved.id); await test.coordinator.waitForOperation()
+        let speakerText = try test.storage.store.read(saved.id).transcript
+        #expect(speakerText != legacy)
+        #expect(try test.storage.store.read(saved.id).analysis?.previousIsLegacy == true)
+        test.coordinator.generateNotes(saved.id); await test.coordinator.waitForOperation()
+        test.coordinator.restoreTranscript(saved.id)
+        #expect(try test.storage.store.read(saved.id).transcript == legacy)
+        #expect(try test.storage.store.read(saved.id).notesStale)
+        let calls = test.transcriber.sessionCalls
+        test.coordinator.retry(saved.id); await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == calls)
+        let exported = test.storage.store.root.appending(path: "restored.txt")
+        test.coordinator.export(saved.id, to: exported)
+        #expect(try String(contentsOf: exported, encoding: .utf8) == legacy)
+        test.coordinator.copyLastTranscript()
+        #expect(test.injector.copied.last == "original source transcript")
+        test.coordinator.restoreTranscript(saved.id)
+        #expect(try test.storage.store.read(saved.id).transcript == speakerText)
+        #expect(try !test.storage.store.read(saved.id).notesStale)
+        #expect(test.coordinator.lastTranscript == speakerText)
+    }
+    @Test func speakerUpgradeRetainsEmptyAndPartialLegacyResultsAcrossReload() async throws {
+        for outcome in ["empty", "whitespace", "silence", "partial"] {
+            let test = CoordinatorFixture(); let store = test.storage.store
+            let saved = try savedAudio(store, amplitude: outcome == "silence" ? 0 : 0.1)
+            try AudioJobPreparer().prepare(session: saved.id, store: store)
+            try store.update(saved.id) {
+                if outcome != "silence" {
+                    $0.jobs[0].state = .complete
+                    $0.jobs[0].response = Transcription(text: outcome == "partial" ? "retained words" : outcome == "whitespace" ? " \n " : "")
+                }
+                if outcome == "partial" {
+                    $0.jobs.append(TranscriptionJob(id: "failed", source: .system, filename: "failed.wav", start: 0, frames: 16_000, state: .failed))
+                }
+            }
+            let legacy = try store.read(saved.id)
+            #expect(legacy.transcriptionComplete == (outcome != "partial"))
+            test.coordinator.reprocess(saved.id); await test.coordinator.waitForOperation()
+            let reopened = SessionStore(root: store.root)
+            let replacement = try reopened.read(saved.id)
+            let active = try #require(replacement.analysis?.active)
+            #expect(replacement.analysis?.previousIsLegacy == true)
+            test.coordinator.restoreTranscript(saved.id)
+            let restored = try reopened.read(saved.id)
+            #expect(restored.analysis?.active == nil)
+            #expect(restored.transcript == legacy.transcript)
+            #expect(restored.transcriptionComplete == legacy.transcriptionComplete)
+            try reopened.restoreTranscript(saved.id)
+            let toggled = try SessionStore(root: store.root).read(saved.id)
+            #expect(toggled.analysis?.active?.id == active.id)
+            #expect(toggled.analysis?.previousIsLegacy == true)
+            try reopened.restoreTranscript(saved.id)
+            #expect(try store.read(saved.id).analysis?.active == nil)
+            #expect(try store.read(saved.id).transcript == legacy.transcript)
+        }
+    }
+    @Test func copyLastTranscriptReflectsEditsOnlyToItsOwnRecording() async throws {
+        let test = CoordinatorFixture(); let older = try savedAudio(test.storage.store)
+        test.coordinator.reprocess(older.id); await test.coordinator.waitForOperation()
+        let last = try savedAudio(test.storage.store)
+        test.coordinator.reprocess(last.id); await test.coordinator.waitForOperation()
+        test.coordinator.editTranscript(last.id) { try $0.rename("S01", to: "Brian") }
+        test.coordinator.copyLastTranscript()
+        #expect(test.injector.copied.last?.contains("Brian") == true)
+        let copied = test.injector.copied.last
+        test.coordinator.editTranscript(older.id) { try $0.rename("S01", to: "Older person") }
+        test.coordinator.copyLastTranscript()
+        #expect(test.injector.copied.last == copied)
+        test.coordinator.reprocess(last.id); await test.coordinator.waitForOperation()
+        test.coordinator.restoreTranscript(last.id)
+        #expect(test.coordinator.lastTranscript == copied)
+    }
+    @Test func deadlineWarnsStopsOnceAndCapsAudio() async throws {
+        let test = CoordinatorFixture(); test.recordingLimit = 0.2; test.warningSeconds = 0.15
+        test.coordinator.startSession(); await test.coordinator.waitForOperation()
+        try await Task.sleep(for: .milliseconds(85))
+        #expect(test.coordinator.recordingWarning)
+        try await Task.sleep(for: .milliseconds(150))
+        test.coordinator.stopSession(); test.capture.fail?(TestError.failed)
+        await test.coordinator.waitForOperation()
+        #expect(test.capture.stopCalls == 1)
+        #expect(test.coordinator.phase == .idle)
+        let record = try #require(test.coordinator.sessions.first)
+        #expect(record.endedAtLimit == true)
+        #expect(record.duration <= 0.2)
+        #expect(record.transcriptionComplete)
+        #expect(test.transcriber.sessionCalls == 1)
+    }
+    @Test func userStopCancelsDeadlineAndSilenceSkipsInference() async throws {
+        let test = CoordinatorFixture(); test.recordingLimit = 0.5; test.capture.amplitude = 0
+        test.coordinator.startSession(); await test.coordinator.waitForOperation()
+        test.coordinator.stopSession(); await test.coordinator.waitForOperation()
+        try await Task.sleep(for: .milliseconds(550))
+        #expect(test.capture.stopCalls == 1)
+        #expect(test.transcriber.sessionCalls == 0)
+        #expect(test.coordinator.sessions.first?.transcriptionComplete == true)
+        #expect(test.coordinator.sessions.first?.endedAtLimit != true)
+    }
+    @Test func rejectedReplacementRetainsRawCorrectionsAndRetriesFrozenProfile() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession(); await test.coordinator.waitForOperation()
+        test.coordinator.stopSession(); await test.coordinator.waitForOperation()
+        let id = try #require(test.coordinator.sessions.first).id
+        test.coordinator.editTranscript(id) { try $0.rename("S01", to: "Brian") }
+        let before = try test.storage.store.read(id).transcript
+        test.transcriber.sessionResponse = Data("{broken response".utf8)
+        test.coordinator.reprocess(id); await test.coordinator.waitForOperation()
+        #expect(try test.storage.store.read(id).transcript == before)
+        #expect(try test.storage.store.read(id).analysis?.attempt?.rawResponse == test.transcriber.sessionResponse)
+        let frozen = try #require(test.storage.store.read(id).analysis?.attempt?.profile)
+        #expect(frozen.prompt == SessionTranscriptionProfile.officialPrompt)
+        test.transcriber.profile.model = "changed-model"
+        test.transcriber.profile.prompt = "changed prompt"
+        test.transcriber.sessionResponse = nil
+        test.coordinator.retry(id); await test.coordinator.waitForOperation()
+        #expect(test.transcriber.requestedProfiles.last == frozen)
+        #expect(try test.storage.store.read(id).analysis?.previous?.transcript == before)
+        test.coordinator.restoreTranscript(id)
+        #expect(try test.storage.store.read(id).transcript == before)
+        let calls = test.transcriber.sessionCalls
+        test.coordinator.retry(id); await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == calls)
+        #expect(test.injector.injected.isEmpty)
+        #expect(test.transcriber.transcriptionCalls == 0)
+    }
+    @Test func savedSessionRetryPreservesAbsentPrompt() async throws {
+        let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)
+        var old = SessionTranscriptionProfile(); old.prompt = nil
+        try test.storage.store.update(saved.id) {
+            $0.analysis = SessionAnalysis(attempt: .init(profile: old, state: .failed))
+        }
+        #expect(try test.storage.store.read(saved.id).analysis?.attempt?.profile.prompt == nil)
+        test.coordinator.retry(saved.id); await test.coordinator.waitForOperation()
+        #expect(test.transcriber.requestedProfiles.count == 1)
+        #expect(test.transcriber.requestedProfiles.first?.prompt == nil)
+        #expect(try test.storage.store.read(saved.id).analysis?.active?.profile.prompt == nil)
+    }
+    @Test func sessionCancellationAndMissingModelRetainAudioAndActiveResult() async throws {
+        let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)
+        test.transcriber.prepareError = TestError.failed
+        test.coordinator.reprocess(saved.id); await test.coordinator.waitForOperation()
+        #expect(try test.storage.store.read(saved.id).analysis?.attempt?.state == .failed)
+        #expect(test.transcriber.sessionCalls == 0)
+        test.transcriber.prepareError = nil
+        test.coordinator.retry(saved.id); await test.coordinator.waitForOperation()
+        let original = try test.storage.store.read(saved.id).transcript
+        test.transcriber.suspend = true
+        test.coordinator.reprocess(saved.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        #expect(try sleepAssertions(for: saved.id) == Set(["PreventUserIdleSystemSleep"]))
+        test.coordinator.cancelProcessing(); test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        let record = try test.storage.store.read(saved.id)
+        #expect(record.transcript == original)
+        #expect(record.analysis?.attempt?.state == .failed)
+        #expect(test.coordinator.message.contains("oMLX may still be processing"))
+        #expect(try sleepAssertions(for: saved.id).isEmpty)
+        #expect(FileManager.default.fileExists(atPath: try test.storage.store.file(saved.id, record.segments[0].filename).path))
+    }
+    @Test func notesUseCorrectedNamesAndBecomeStaleOnFurtherEdit() async throws {
+        let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)
+        test.coordinator.reprocess(saved.id); await test.coordinator.waitForOperation()
+        test.coordinator.editTranscript(saved.id) { try $0.rename("S01", to: "Brian") }
+        test.coordinator.generateNotes(saved.id); await test.coordinator.waitForOperation()
+        #expect(test.transcriber.notesInput?.contains("Brian") == true)
+        #expect(try !test.storage.store.read(saved.id).notesStale)
+        test.coordinator.editTranscript(saved.id) { try $0.assign($0.turns[0].id, to: nil) }
+        #expect(try test.storage.store.read(saved.id).notesStale)
+        #expect(try test.storage.store.read(saved.id).notes == "notes")
+    }
     @Test func sessionPreventsIdleSleepAndReleasesOnEveryExit() async throws {
         for ending in ["stop", "start failure", "capture failure", "stop failure", "quit"] {
             let test = CoordinatorFixture()
@@ -154,7 +349,7 @@ import Testing
         }
         #expect(test.coordinator.sessions.count == 2)
         #expect(test.coordinator.sessions.allSatisfy { $0.captureState == .complete && $0.transcriptionComplete })
-        #expect(test.transcriber.transcriptionCalls == 2)
+        #expect(test.transcriber.sessionCalls == 2)
         #expect(test.injector.injected.isEmpty)
         #expect(test.recorder.startCalls == 0)
     }
@@ -189,6 +384,7 @@ import Testing
     @Test func retryPreservesCompletedResponsesAndNotesStaySeparate() async throws {
         let test = CoordinatorFixture()
         let saved = try savedAudio(test.storage.store)
+        try test.storage.store.update(saved.id) { $0.kind = .dictation }
         try AudioJobPreparer().prepare(session: saved.id, store: test.storage.store)
         let first = try test.storage.store.read(saved.id).jobs[0]
         var second = first; second.id = "second"; second.start = 2
@@ -269,13 +465,24 @@ private func sleepAssertions(for session: UUID) throws -> Set<String> {
     let transcriber = TestTranscriber()
     let injector = TestInjector()
     let authorizer = TestAuthorizer()
-    lazy var coordinator = DictationCoordinator(recorder: recorder, transcriber: transcriber, injector: injector, authorizer: authorizer, store: storage.store, capture: capture)
+    let playback = TestPlayback()
+    var recordingLimit = SessionTranscriptionProfile.maximumDuration
+    var warningSeconds = 300.0
+    lazy var coordinator = DictationCoordinator(recorder: recorder, transcriber: transcriber, injector: injector, authorizer: authorizer, store: storage.store, capture: capture, playback: playback, recordingLimit: recordingLimit, warningSeconds: warningSeconds)
+}
+
+private final class PlaybackCaptureEvents { var values: [String] = [] }
+@MainActor private final class TestPlayback: PlaybackStopping {
+    var onStop: (() -> Void)?
+    func stop() { onStop?() }
 }
 
 private final class TestRecorder: Recording {
     var startCalls = 0; var stopCalls = 0
     var startError: Error?; var stopError: Error?
+    var onStart: (() -> Void)?
     func start(at url: URL) throws {
+        onStart?()
         startCalls += 1
         let buffer = try pcm(rate: 16_000, channels: 1, frames: 16_000)
         let file = try AVAudioFile(forWriting: url, settings: recorderSettings)
@@ -292,11 +499,14 @@ private final class TestRecorder: Recording {
     var stopError: Error?
     var fail: (@MainActor @Sendable (Error) -> Void)?
     var writer: SourceAudioWriter?
-    func start(session: UUID, store: SessionStore, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
+    var amplitude: Float = 0.1
+    var onStart: (() -> Void)?
+    func start(session: UUID, store: SessionStore, maximumDuration: Double, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
+        onStart?()
         startCalls += 1; fail = failed
         if let startError { throw startError }
-        writer = SourceAudioWriter(store: store, session: session, origin: 0)
-        try writer?.append(pcm(frames: 48_000), source: .microphone, timestamp: 0)
+        writer = SourceAudioWriter(store: store, session: session, origin: 0, maximumDuration: maximumDuration)
+        try writer?.append(pcm(frames: 48_000, amplitude: amplitude), source: .microphone, timestamp: 0)
     }
     func stop() async throws {
         stopCalls += 1; try writer?.finish(); writer = nil
@@ -306,6 +516,11 @@ private final class TestRecorder: Recording {
 
 @MainActor private final class TestTranscriber: Transcribing {
     var prepareCalls = 0; var transcriptionCalls = 0
+    var sessionCalls = 0
+    var profile = SessionTranscriptionProfile()
+    var requestedProfiles: [SessionTranscriptionProfile] = []
+    var sessionResponse: Data?
+    var notesInput: String?
     var output = "spoken text"
     var prepareError: Error?; var transcriptionError: Error?; var notesError: Error?
     var failCall: Int?
@@ -321,7 +536,20 @@ private final class TestRecorder: Recording {
         return Transcription(text: output)
     }
     func resume() { continuation?.resume(); continuation = nil }
-    func notes(for _: String) async throws -> String { if let notesError { throw notesError }; return "notes" }
+    func sessionProfile() throws -> SessionTranscriptionProfile { profile }
+    func prepareSession(profile: SessionTranscriptionProfile) async throws { try await prepare() }
+    func transcribeSession(_ file: URL, profile: SessionTranscriptionProfile) async throws -> Data {
+        sessionCalls += 1; requestedProfiles.append(profile)
+        if suspend { waiting = true; await withCheckedContinuation { continuation = $0 }; waiting = false }
+        if let transcriptionError { throw transcriptionError }
+        if let sessionResponse { return sessionResponse }
+        let audio = try AVAudioFile(forReading: file)
+        let duration = Double(audio.length) / audio.processingFormat.sampleRate
+        return try JSONEncoder().encode(Transcription(text: "[0][S01]\(output)[\(duration)]",
+            segments: [.init(start: 0, end: duration, text: "[S01] \(output)", speakerID: "S01")],
+            usage: .init(type: "tokens", inputTokens: 100, outputTokens: 10, totalTokens: 110)))
+    }
+    func notes(for transcript: String) async throws -> String { notesInput = transcript; if let notesError { throw notesError }; return "notes" }
 }
 
 @MainActor private final class TestInjector: Injecting {

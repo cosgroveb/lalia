@@ -89,9 +89,40 @@ def crop(segments, start, end):
             for segment in segments if segment["end"] > start and segment["start"] < end]
 
 
+def stress_clip(original, output, words, turns, minutes):
+    """Repeat the meeting, ending with its tail so final speech stays known."""
+    destination = output / f"ami-{MEETING}-stress-{minutes}m.wav"
+    duration = minutes * 60
+    reference_words, reference_turns, blocks = [], [], []
+    with wave.open(str(original)) as source, wave.open(str(destination), "wb") as target:
+        target.setparams(source.getparams())
+        rate, frames = source.getframerate(), source.getnframes()
+        written = 0
+        while written < duration * rate:
+            count = min(frames, duration * rate - written)
+            start = frames - count if count < frames else 0
+            source.setpos(start)
+            offset = written / rate
+            for reference, entries in ((reference_words, words), (reference_turns, turns)):
+                reference.extend(dict(item, start=item["start"] + offset, end=item["end"] + offset)
+                                 for item in crop(entries, start / rate, (start + count) / rate))
+            blocks.append({"start": offset, "end": offset + count / rate, "source_start": start / rate})
+            remaining = count
+            while remaining:
+                chunk = min(remaining, rate * 30)
+                target.writeframes(source.readframes(chunk))
+                remaining -= chunk
+            written += count
+    return {"id": destination.stem, "audio_path": str(destination), "duration": duration,
+            "private": False, "stress_fixture": True, "repeated_blocks": blocks,
+            "reference_segments": reference_words, "reference_turns": reference_turns,
+            "words_per_speaker": dict(Counter(word["speaker_id"] for word in reference_words))}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--stress-minutes", type=int, nargs="*", choices=(60, 90), default=[])
     args = parser.parse_args()
     output = args.output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=True)
@@ -128,6 +159,7 @@ def main():
             "boundary_words_clipped": boundary_words,
             "words_per_speaker": dict(Counter(word["speaker_id"] for word in reference_words)),
         })
+    clips.extend(stress_clip(original, output, words, turns, minutes) for minutes in args.stress_minutes)
     manifest = {
         "dataset": "AMI Meeting Corpus, ES2004a, headset mix, official full-corpus ASR test split",
         "license": "CC-BY-4.0",
@@ -145,7 +177,7 @@ def main():
     path = output / "manifest.json"
     path.write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps({"manifest": str(path), "excluded": excluded, "clips": [
-        {k: clip[k] for k in ("id", "duration", "words_per_speaker", "boundary_words_clipped")}
+        {k: clip[k] for k in ("id", "duration", "words_per_speaker", "stress_fixture") if k in clip}
         for clip in clips]}, indent=2))
 
 

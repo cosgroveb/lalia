@@ -28,6 +28,17 @@ func savedAudio(_ store: SessionStore, seconds: Double = 1, amplitude: Float = 0
 }
 
 struct AudioTests {
+    @Test func negativeTimestampJitterCannotAppendPastRecordingLimit() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let record = try store.create(kind: .session)
+        let writer = SourceAudioWriter(store: store, session: record.id, origin: 0)
+        try writer.append(pcm(rate: 16_000, channels: 1, frames: 2_000), source: .microphone, timestamp: 5_399.875)
+        try writer.append(pcm(rate: 16_000, channels: 1, frames: 100), source: .microphone, timestamp: 5_400 - 1.25 / 16_000)
+        try writer.finish()
+        let saved = try store.read(record.id)
+        #expect(saved.duration <= 5_400)
+        #expect(saved.segments.reduce(0) { $0 + $1.frames } == 2_000)
+    }
     @Test func writeFailureRetainsCompletedAudio() throws {
         let fixture = TemporaryStore(); let store = fixture.store
         let record = try store.create(kind: .session)
