@@ -163,6 +163,20 @@ curl --fail --location --output "$matching/3dspeaker_speech_campplus_sv_zh-cn_16
 Review the frozen selection, then repeat without `--select-only`. Completed
 results cannot be overwritten. Only the public `ami-ES2004a-full` clip is used.
 
+For the controlled two-second follow-up, preserve the original three-second
+selection and shorten only its end frames. Use the same runtime and model:
+
+```sh
+"$matching/venv/bin/python" -B experiments/speaker-labels/window_matching.py \
+  --manifest "$manifest" --model "$matching/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx" \
+  --output /private/path/to/fresh-two-second-results --clip-seconds 2 --select-only
+```
+
+Compare the frozen starts, labels, roles and input hashes with the original
+protocol before repeating without `--select-only`. The default remains three
+seconds. Both durations require all 15 held-out clips correctly accepted at
+0.55, with no rejects or wrong identities, before proceeding to an ASR run.
+
 `short_windows.py` then tests three fixed windows, [0,390], [330,750], and
 [690,end] seconds, through the existing isolated patched API runtime. Its
 paths name the saved October 26 baseline, prompt, launcher and pins under
@@ -209,3 +223,25 @@ seconds. Enrollment stopped before matching because S03's longest clean span
 left 2.98 seconds after trimming, below the fixed three-second requirement.
 No later window, matching or seam scoring ran. Request completion and the last
 timestamp do not establish full speech coverage or merged accuracy.
+
+The controlled two-second follow-up retained all 23 original clip starts and
+roles. It correctly accepted 13 of 15 held-out clips, rejected one and wrongly
+accepted one as another speaker. It failed the frozen acceptance rule. No
+two-second ASR follow-up ran. Wall time was 0.514 seconds and peak RSS was
+251.91 MiB. The 0.5-second footprint sampler caught only startup (196,752
+bytes), so its sampled value missed the worker's peak.
+
+## Tests
+
+From the repository root in an initialized login shell, use the matching
+environment for its feature-extraction tests and the scoring environment for
+the remaining suites. Neither command runs model inference.
+
+```sh
+matching="$HOME/.local/state/lalia-speaker-qualification/window-matching-20261027"
+scoring="$HOME/.local/state/lalia-speaker-eval-20261025/scoring-venv/bin/python"
+"$matching/venv/bin/python" -B -m unittest discover \
+  -s experiments/speaker-labels -p test_window_matching.py
+PYTHONPATH=experiments/speaker-labels "$scoring" -B -m unittest \
+  test_score test_run test_qualification test_short_windows
+```

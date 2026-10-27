@@ -50,6 +50,39 @@ class WindowMatchingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Insufficient later held-out"):
             select_clips(fixture)
 
+    def test_two_second_crops_preserve_original_selection_and_update_counts(self):
+        fixture = self.fixture()
+        short_span = {"start": 55, "end": 57.5, "speaker_id": "0"}
+        fixture["reference_turns"].append(short_span)
+        fixture["reference_segments"].append(short_span)
+        original, original_counts = select_clips(fixture)
+        self.assertEqual((original, original_counts), select_clips(fixture, 3))
+        shortened, counts = select_clips(fixture, 2)
+        self.assertEqual(shortened, [dict(sample, end_frame=sample["start_frame"] + 32000)
+                                     for sample in original])
+        self.assertFalse(any(sample["start_frame"] == int(55.15 * 16000) for sample in shortened))
+        for speaker, values in original_counts.items():
+            self.assertEqual(counts[speaker], dict(values, enrollment_seconds=4, evaluation_seconds=8,
+                                                  minimum_separation_seconds=
+                                                  values["minimum_separation_seconds"] + 1))
+        with self.assertRaisesRegex(ValueError, "two or three seconds"):
+            select_clips(fixture, 1)
+
+    def test_embed_uses_requested_duration_and_keeps_three_second_default(self):
+        session = Mock()
+        session.get_inputs.return_value = [Mock(name="input")]
+        session.get_inputs.return_value[0].name = "features"
+        session.run.return_value = [np.ones((1, 192), dtype=np.float32)]
+        two_seconds = np.ones(32000, dtype="<i2").tobytes()
+        with self.assertRaisesRegex(ValueError, "Expected 3 seconds"):
+            window_matching.embed(two_seconds, session)
+        session.run.assert_not_called()
+        vector = window_matching.embed(two_seconds, session, 2)
+        self.assertEqual(session.run.call_args.args[1]["features"].shape, (1, 198, 80))
+        self.assertAlmostEqual(float(np.linalg.norm(vector)), 1, places=6)
+        window_matching.embed(np.ones(48000, dtype="<i2").tobytes(), session)
+        self.assertEqual(session.run.call_args.args[1]["features"].shape, (1, 298, 80))
+
     def test_frozen_matcher_rejects_and_does_not_use_evaluation_labels(self):
         centroids = {"a": normalize([1, 0, 0]), "b": normalize([0, 1, 0])}
         before = {key: value.copy() for key, value in centroids.items()}

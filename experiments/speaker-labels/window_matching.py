@@ -89,7 +89,10 @@ def clean_spans(turns):
     return spans
 
 
-def select_clips(clip):
+def select_clips(clip, clip_seconds=3):
+    """Select with the original three-second rules, then shorten if requested."""
+    if type(clip_seconds) is not int or clip_seconds not in (2, 3):
+        raise ValueError("Clip duration must be two or three seconds")
     speakers = sorted({turn["speaker_id"] for turn in clip["reference_turns"]})
     if len(speakers) != 4:
         raise ValueError("Expected four reference speakers")
@@ -124,12 +127,15 @@ def select_clips(clip):
             raise ValueError(f"Insufficient later held-out clips for {speaker}: {len(held_out)}")
         evaluation = [dict(held_out[i * (len(held_out) - 1) // (held_out_count - 1)], role="evaluation")
                       for i in range(held_out_count)]
-        selected.extend(enrollment + evaluation)
+        selected.extend(dict(sample, end_frame=sample["start_frame"] + clip_seconds * RATE)
+                        for sample in enrollment + evaluation)
         counts[speaker] = {"candidate_clips": len(pool), "enrollment_clips": 2,
                            "evaluation_clips": held_out_count,
-                           "enrollment_seconds": 6, "evaluation_seconds": 3 * held_out_count,
+                           "enrollment_seconds": 2 * clip_seconds,
+                           "evaluation_seconds": clip_seconds * held_out_count,
                            "minimum_separation_seconds":
-                               (evaluation[0]["start_frame"] - enrollment[-1]["end_frame"]) / RATE}
+                               (evaluation[0]["start_frame"] - enrollment[-1]["start_frame"]
+                                - clip_seconds * RATE) / RATE}
     return selected, counts
 
 
@@ -156,7 +162,7 @@ def ready(per_speaker):
         for counts in per_speaker.values())
 
 
-def embed(audio, session):
+def embed(audio, session, clip_seconds=3):
     # Adapted from OpenMOSS/MOSS-Transcribe-Diarize PR 58, speaker.py at
     # 309f8f6d3e5cc94cebdb4d5f6b3fb9765409c2a5, Apache-2.0.
     # Modified to validate fixed-length samples and use a caller-owned CPU session.
@@ -164,9 +170,11 @@ def embed(audio, session):
     import kaldi_native_fbank as knf
     import numpy as np
 
+    if type(clip_seconds) is not int or clip_seconds not in (2, 3):
+        raise ValueError("Clip duration must be two or three seconds")
     samples = np.frombuffer(audio, dtype="<i2").astype(np.float32)
-    if len(samples) != 3 * RATE or not np.any(samples):
-        raise ValueError("Expected three seconds of non-silent PCM")
+    if len(samples) != clip_seconds * RATE or not np.any(samples):
+        raise ValueError(f"Expected {clip_seconds} seconds of non-silent PCM")
     samples /= np.max(np.abs(samples))
     options = knf.FbankOptions()
     options.frame_opts.samp_freq = RATE
@@ -203,7 +211,8 @@ def worker(output):
             raise ValueError("Expected 16 kHz mono PCM16 input")
         for sample in protocol["clips"]:
             source.setpos(sample["start_frame"])
-            vectors.append(embed(source.readframes(sample["end_frame"] - sample["start_frame"]), session))
+            vectors.append(embed(source.readframes(sample["end_frame"] - sample["start_frame"]), session,
+                                 protocol.get("clip_seconds", 3)))
     centroids = {}
     for speaker in protocol["counts"]:
         enrolled = [vector for sample, vector in zip(protocol["clips"], vectors)
@@ -236,6 +245,7 @@ def worker(output):
     result = {
         "scope": "Oracle-segment embedding feasibility, not diarization or open-set qualification",
         "threshold": THRESHOLD, "counts": protocol["counts"],
+        "clip_seconds": protocol.get("clip_seconds", 3),
         "nearest_confusion": confusion, "threshold_confusion": threshold_confusion,
         "accepted": sum(accepted.values()), "rejected": sum(rejected.values()),
         "wrong_accepted": sum(wrong.values()), "correct_accepted": sum(correct.values()),
@@ -274,6 +284,8 @@ def main():
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--model", type=Path)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--clip-seconds", type=int, choices=(2, 3), default=3,
+                        help="Crop duration at unchanged three-second selection starts (default: 3)")
     parser.add_argument("--select-only", action="store_true")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
@@ -289,9 +301,11 @@ def main():
                 if clip["id"] == "ami-ES2004a-full")
     if clip["private"] is not False or clip.get("stress_fixture") or clip.get("repeated_blocks"):
         raise ValueError("Only the public, original AMI meeting is allowed")
-    selected, counts = select_clips(clip)
+    selected, counts = select_clips(clip, args.clip_seconds)
+    duration_policy = ("3 s clips on a 4 s grid." if args.clip_seconds == 3 else
+                       "original 3 s selection on a 4 s grid, shortened to 2 s at unchanged starts.")
     protocol = {
-        "policy": "RTTM single-speaker spans, 150 ms trim, 3 s clips on a 4 s grid. "
+        "policy": f"RTTM single-speaker spans, 150 ms trim, {duration_policy} "
                   "Manual words veto cross-speaker contamination. First two distinct spans enroll. "
                   "Four index-quantile held-out clips start >=30 s after final enrollment, "
                   "except MEO015 has three after an explicit pre-inference amendment. "
@@ -306,12 +320,15 @@ def main():
         "model_url": MODEL_URL, "model_sha256": MODEL_SHA256,
         "clips": selected, "counts": counts, "threshold": THRESHOLD,
     }
+    if args.clip_seconds != 3:
+        protocol["clip_seconds"] = args.clip_seconds
     path = output / "protocol.json"
     if path.exists() and json.loads(path.read_text()) != protocol:
         raise ValueError("Existing frozen protocol differs")
     save(path, protocol)
     if args.select_only:
-        print(json.dumps({"counts": counts, "selected_audio_seconds": len(selected) * 3}, indent=2))
+        print(json.dumps({"counts": counts,
+                          "selected_audio_seconds": len(selected) * args.clip_seconds}, indent=2))
         return
     if (output / "result.json").exists():
         raise ValueError("Refusing to overwrite an existing result")
