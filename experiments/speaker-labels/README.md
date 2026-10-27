@@ -507,8 +507,8 @@ for byte. Input/prompt and saved-logit hashes matched, frozen files stayed
 unchanged and owned processes exited.
 
 Frequency precision explains a large change in this stopping decision across
-both runtimes. The candidate still needs complete transcription and speaker
-coverage checks on the saved long audio. No production change is qualified.
+both runtimes. The actual API test below still failed long-audio completion.
+No production change is qualified.
 
 Run `test_eos_*.py` as above, then include the native wrapper tests:
 
@@ -518,3 +518,40 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 /opt/homebrew/opt/omlx/libexec/bin/pyth
 ```
 
 All 28 relevant tests passed: 17 RoPE, eight allocator and three native tests.
+
+### Actual API qualification
+
+The frequency change extended the 90-minute fixture's transcription from
+36m49s to 62m52s, but it still stopped early. The short baseline passed.
+
+A separate launcher called the original MOSS post-load hook before installing
+the measured native-frequency wrapper on that model's 28 layers. It reused
+the frozen runtime, official prompt, 49,152-token cap and 4,096-token API
+prefill. Seven focused tests and independent setup review passed.
+
+| Audio / frequencies | Accepted | Last speech | HTTP seconds | Peak GiB | cpWER | Collared DER |
+|---|---|---:|---:|---:|---:|---:|
+| 17m29 / original | Yes | 1048.98s | 68.64 | 8.36 | 12.44% | 15.32% |
+| 17m29 / BF16-derived | Yes | 1048.94s | 65.14 | 8.25 | 12.17% | 13.78% |
+| 90m / original | No | 2208.71s | 476.03 | 23.94 | 65.70% | 66.22% |
+| 90m / BF16-derived | No | 3771.62s | 857.00 | 26.13 | 42.76% | 43.42% |
+
+The candidate baseline returned 8,693 output tokens, native EOS and 293
+reconciled segments across four speakers. The long request returned 29,448
+output tokens plus observed EOS 151645, below the output ceiling. Its 933
+segments leave 19 unmatched trailing characters and the final 27m08s
+untranscribed. Validation rejected `Unmatched raw transcript span`.
+
+Speaker mappings agree across the first three complete repeated sections and
+the partial fourth. The absent final sections fail whole-recording continuity.
+This is missing coverage, not evidence of identity drift in the returned
+sections. Timestamp matching found beginning and middle passages, with no
+final speech available to check. Swap did not grow.
+
+All 1,495 frozen files matched after both requests. Owned processes exited,
+the experimental port closed and production oMLX remained healthy. Evidence,
+protocol, source archive and cleanup records are under
+`~/.local/state/lalia-speaker-qualification/official-api-path/native-bf16-api-20261027`.
+Production app, runtime and configuration remain unchanged. This repeated
+fixture adds capacity evidence, not independent long-meeting accuracy evidence.
+The frequency change alone is not a qualified truncation fix.
