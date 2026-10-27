@@ -1,0 +1,18 @@
+{
+  "model_revision": "704aa4a9c304e8520be88901e0d1960158ef5b15",
+  "embedding_float32_sha256": "dc2be5721a721334f35c648730b9a232b6f6847e0ed4da9ddbd74666202d315f",
+  "files": {
+    "config.json": "2b2b7a6e61334152bdd7ecf8a4da3073b4940a097e193d1d2b22093e77535234",
+    "model-00000-of-00001.safetensors": "9a0ceb4ab7330357db3ff583dba8d83625d5b733b00e1d55d6970e11b07026c4",
+    "combined-embeddings.safetensors": "416a12eb70e1b29b24210b7fd1e620e93436514102960189d3283d632af9860a"
+  },
+  "transformers_sources": {
+    "models/qwen3/modeling_qwen3.py": "cbb7f2dc274c2f5592746c0dc6985ca50353efa07376f92cc922b77680a74f69",
+    "models/qwen3/configuration_qwen3.py": "49d9ccd0f29ccd977b93dba2004f84b867891b3d0509b71fd8ba3ed01054e64d",
+    "integrations/sdpa_attention.py": "53c7229daca9ade4c5df874194448938c1edc925abbc71809f9750dd66381e6f",
+    "cache_utils.py": "702144bb44553f6339ea1bf23c8205a708bb5f8c7c09cb3a2db484182646743c",
+    "masking_utils.py": "50a737f63d8c778a5597fa34ac139049af921f44958205e3e1c29fe2bae77254",
+    "modeling_rope_utils.py": "fd7407b2dc3e16de2507e8619906ff9f84fdda65d49c67a41db4974fd6982a47",
+    "initialization.py": "a2392653161633d4f8aefb473e776113ec5df8844acdba892569407ca56c2d6a"
+  }
+}

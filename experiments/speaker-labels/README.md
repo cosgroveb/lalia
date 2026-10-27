@@ -366,3 +366,82 @@ ID won the tie. This establishes sensitivity to RoPE operator numerics at
 the frozen prefix. It does not establish a robust fix or completed
 transcription. The full input digest matched the earlier attempt, cleanup
 reaped both children, and all 1,484 frozen files remained unchanged.
+
+## CUDA decoder comparison
+
+`cuda/` scores the same saved embeddings with the official Qwen3 decoder
+on Spark's GB10. It loads unchanged BF16 decoder weights and the tied head,
+uses the same 2,048-token schedule, and validates every layer's cache length.
+It does not encode audio or generate a transcript. The default loader matches
+the published MOSS runner's BF16 cast, including its rotary-frequency buffer.
+`score --fp32-rope` recomputes that buffer from the pinned default initializer
+on CPU after the cast. It verifies unchanged scaling and the original BF16
+round-back hash. Weights and all other computation remain unchanged. Use a
+fresh root for each comparison. Full native logits accompany the summary.
+
+The isolated ARM64 image uses Torch 2.14.1+cu130 and Transformers 5.17.0.
+Build from `cuda/`, tagging it `lalia-moss-cuda-probe:20261027-r4` for the
+supervisor. The Dockerfile preserves the measured package-install order.
+Its cuSPARSELt repair changes the pinned wheel's invalid platform metadata,
+regenerates RECORD and verifies every other payload hash. Library bytes stay
+unchanged. GCC and libc headers let Torch compile its Triton driver helper.
+The final dependency check must pass.
+
+These are dated, fixture-specific diagnostics. On Spark, prepare a fresh
+root with `probe/` containing the Python scripts and `inputs/` containing
+`manifest.json` plus its three named files. Use the public model and saved
+AMI embeddings from the allocator experiment. The scorer checks their
+hashes and seven installed Transformers source hashes. Do not substitute
+private audio or embeddings. Results are written under `results/<mode>`.
+
+Run `python3 ROOT/probe/supervise.py MODE --root ROOT` on Spark. Modes are
+`smoke` (small attention/GEMM checks), `shapes` (long-context attention),
+`decoder` (tiny complete CPU/CUDA decoder), and `score` (the frozen prefix).
+Review actual results between modes. A failed check is evidence, not
+permission to continue automatically.
+
+The supervisor requires Docker GPU access, an active `vllm-vllm.service`
+and permission to stop/start it. Only `score` pauses that service. It limits
+the container to 300 seconds plus five seconds to stop, 24 GiB with no swap,
+and a 24 GiB CUDA allocator. The scorer requires 32 GiB available initially
+and checks an 8 GiB reserve after each chunk. Cleanup confirms the owned
+container is absent, reaps its client, then restores the service and checks
+health. Read `lifecycle.json` as well as the model result. Restoration can
+take several minutes. No production image or configuration is upgraded.
+
+The October 27 kernel checks passed their fixed CPU tolerances, including
+attention shapes up to 88,814 keys. The tiny complete decoder did not:
+fused CUDA had 2/128 logit errors outside tolerance, and CUDA math had 5/128.
+All three argmaxes agreed. Relative L2 differences from CPU were about
+0.45%. Those failures remain failures. The subsequent full score was
+reviewed as a runtime-specific observation with numerical parity unresolved.
+
+That full score consumed all 88,814 inputs in 51.67 seconds, with 11.75 GiB
+peak CUDA allocation. Continuation 42474 scored 28.625 versus EOS at 21.125,
+a −7.5 EOS margin. This differs from native MLX's +0.125 margin and the
+FP32-reference RoPE tie. It narrows the decoder investigation but does not
+isolate a cause: the official loader rounds frequencies to BF16, and other
+operators differ across runtimes. Peak allocation is not physical footprint,
+and decoder scoring time is not full transcription time. The container and
+client exited, and the original coding service recovered with healthy HTTP.
+
+The frequency-only CUDA control completed in 52.57 seconds with the same
+11.75 GiB peak allocation. Recomputed FP32 frequencies changed the EOS margin
+from −7.5 to zero: EOS and continuation both scored 24.875. These two scores
+match the local FP32-reference RoPE result. This isolates the effect of
+frequency rounding on that CUDA decision. Other logits and operators are not
+established equivalent, and neither run generated continued transcription.
+
+Run the CUDA diagnostic CPU tests without GPU inference:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MOSS_OFFICIAL_SOURCE=/path/to/pinned/moss/source \
+  /opt/homebrew/opt/omlx/libexec/bin/python -B -m unittest discover \
+  -s experiments/speaker-labels/cuda -p 'test_*.py'
+```
+
+The environment needs Torch, Transformers 5.17.0, safetensors, wheel 0.48.0
+and packaging 26.0. The external fixture contains the model's official
+configuration and modeling Python files. Tests verify both hashes before
+importing them. Without `MOSS_OFFICIAL_SOURCE`, only that equivalence test is
+skipped. Acceptance used the fixture: all 41 tests passed with no skips.
