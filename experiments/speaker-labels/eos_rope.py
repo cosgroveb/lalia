@@ -29,6 +29,7 @@ EOS_IDS = (151643, EOS)
 TOTAL = PROMPT_COUNT + PREFIX_COUNT
 CHUNK = 2048
 MODEL_REVISION = "704aa4a9c304e8520be88901e0d1960158ef5b15"
+BF16_FREQUENCY_SHA256 = "fb39dde72a24bd6b8b3573c5e6375d3f163568c8649e0e97f9fd27ef52f0a493"
 
 
 def verify(hashes):
@@ -66,8 +67,10 @@ def installed_operators():
     return operators
 
 
-def prepare(state):
+def prepare(state, bf16_frequencies=False, native_bf16_frequencies=False):
     """Freeze inputs and code without loading model weights or running inference."""
+    if bf16_frequencies and native_bf16_frequencies:
+        raise ValueError("Choose only one BF16 frequency control")
     if state.exists():
         raise ValueError("State already exists; no automatic rerun")
     if Path(sys.executable).resolve() != PYTHON.resolve():
@@ -88,6 +91,7 @@ def prepare(state):
              ORIGINAL / "original-response.json", ORIGINAL / "first-eos.json",
              ORIGINAL / "request-audit.json", source / "eos_rope.py", source / "test_eos_rope.py",
              source / "short_windows.py", source / "window_matching.py", PYTHON.resolve()]
+    paths.extend(source / name for name in ("native_rope_basis.py", "test_native_rope.py"))
     paths.extend(path for path in ORIGINAL.rglob("*") if path.is_file())
     # Pin all isolated runtime sources, including the shared Qwen3 attention and cache.
     paths.extend((BASE / "runtime").rglob("*.py"))
@@ -106,12 +110,25 @@ def prepare(state):
                 "prompt_tokens": PROMPT_COUNT, "generated_prefix_tokens": PREFIX_COUNT,
                 "consumed_tokens": TOTAL, "final_position": TOTAL - 1, "chunk_tokens": CHUNK,
                 "native_required_sampler_id": EOS, "eos_ids": list(EOS_IDS),
-                "reference": "Torch CPU FP32 inverse frequencies/cos/sin; cast to input dtype; separately evaluated products before sum",
+                "bf16_frequencies": bf16_frequencies, "native_bf16_frequencies": native_bf16_frequencies,
+                "reference": "Default Torch FP32 reference, BF16-rounded Torch reference, or native MLX RoPE with BF16-rounded inverse frequencies and FP32 reciprocal denominators",
                 "limits": {"pass_seconds": 300, "overall_seconds": 600, "sampled_footprint_bytes": 32 * 1024**3,
                            "battery_cutoff_percent": 25},
                 "hashes": hashes}
     state.mkdir(mode=0o700)
     save(state / "protocol.json", protocol)
+    (state / "protocol.sha256").write_text(sha256(state / "protocol.json") + "\n")
+    return protocol
+
+
+def read_protocol(state):
+    encoded = (state / "protocol.json").read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != (state / "protocol.sha256").read_text().strip():
+        raise ValueError("Frozen protocol changed")
+    protocol = json.loads(encoded)
+    selection = (protocol["bf16_frequencies"], protocol["native_bf16_frequencies"])
+    if any(type(value) is not bool for value in selection) or all(selection):
+        raise ValueError("Invalid frozen frequency selection")
     return protocol
 
 
@@ -141,14 +158,59 @@ def chunks(count, size=CHUNK):
     yield count - 1, count
 
 
+class NativeBF16RoPE:
+    """MOSS-only native kernel candidate. MLX freqs are FP32 denominators."""
+
+    def __init__(self, count):
+        import mlx.core as mx
+        import numpy as np
+
+        self.count = count
+        with mx.stream(mx.cpu):
+            inverse = 1 / (1000000.0 ** (mx.arange(0, 128, 2, dtype=mx.float32) / 128))
+            rounded = inverse.astype(mx.bfloat16)
+            mx.eval(rounded)
+            stored_hash = hashlib.sha256(np.array(rounded.view(mx.uint8)).tobytes()).hexdigest()
+            if stored_hash != BF16_FREQUENCY_SHA256:
+                raise ValueError("BF16 inverse frequencies differ from CUDA R7")
+            widened = rounded.astype(mx.float32)
+            self.freqs = mx.reciprocal(widened)
+            recovered = mx.reciprocal(self.freqs)
+            mx.eval(self.freqs, recovered)
+            difference = mx.abs(recovered - widened)
+            self.frequencies = {"stored_dtype": str(rounded.dtype), "stored_sha256": stored_hash,
+                                "denominator_dtype": str(self.freqs.dtype),
+                                "denominator_sha256": hashlib.sha256(np.array(self.freqs).tobytes()).hexdigest(),
+                                "cpu_reciprocal_mismatches": int(mx.sum(recovered != widened).item()),
+                                "cpu_max_inverse_difference": float(mx.max(difference).item()),
+                                "cpu_phase_difference_bound": float(mx.max(difference).item()) * (count - 1)}
+
+    def __call__(self, value, offset=0):
+        import mlx.core as mx
+
+        if value.shape[-1] != 128 or offset < 0 or offset + value.shape[-2] > self.count:
+            raise ValueError("Native RoPE outside frozen positions/dimensions")
+        return mx.fast.rope(value, 128, traditional=False, base=None, scale=1.0,
+                            offset=offset, freqs=self.freqs)
+
+
 class ReferenceRoPE:
     """Transformers Qwen3 default RoPE, with Torch CPU FP32 trigonometry."""
 
-    def __init__(self, count, dimensions=128, base=1000000.0):
+    def __init__(self, count, dimensions=128, base=1000000.0, bf16_frequencies=False):
         import mlx.core as mx
         import torch
 
         inverse = 1 / (base ** (torch.arange(0, dimensions, 2, dtype=torch.float32) / dimensions))
+        original_hash = hashlib.sha256(inverse.view(torch.uint8).numpy().tobytes()).hexdigest()
+        if bf16_frequencies:
+            inverse = inverse.to(torch.bfloat16)
+        stored_hash = hashlib.sha256(inverse.view(torch.uint8).numpy().tobytes()).hexdigest()
+        if bf16_frequencies and stored_hash != BF16_FREQUENCY_SHA256:
+            raise ValueError("BF16 inverse frequencies differ from CUDA R7")
+        self.frequencies = {"original_float32_sha256": original_hash, "stored_dtype": str(inverse.dtype),
+                            "stored_sha256": stored_hash, "trigonometry_dtype": "torch.float32"}
+        inverse = inverse.float()
         positions = torch.arange(count, dtype=torch.float32)
         angles = (inverse[None, :, None] @ positions[None, None, :]).transpose(1, 2)
         doubled = torch.cat((angles, angles), dim=-1)
@@ -207,6 +269,7 @@ def compare(native, reference):
 
 def token_pass(model, embeddings, state, phase, began=None):
     import mlx.core as mx
+    import numpy as np
 
     began = time.monotonic() if began is None else began
     save(state / "progress.json", {"phase": phase, "started_monotonic": began, "consumed": 0})
@@ -227,8 +290,15 @@ def token_pass(model, embeddings, state, phase, began=None):
             raise ValueError("Final cache offset differs")
         final = hidden[:, -1:, :]
         logits = model.model.language_model.embed_tokens.as_linear(final) if model.lm_head is None else model.lm_head(final)
+        path = state / f"{phase}-logits.safetensors"
+        raw = logits[0, 0]
+        mx.save_safetensors(str(path), {"logits": raw})
+        artifact = {"logits_file": path.name, "logits_file_sha256": sha256(path),
+                    "raw_logit_dtype": str(raw.dtype), "logits_shape": list(raw.shape),
+                    "raw_logits_sha256": hashlib.sha256(np.array(raw.view(mx.uint8)).tobytes()).hexdigest()}
+        save(state / f"{phase}-logits.json", artifact)
         measured = scores(logits[0, 0])
-        measured.update(wall_seconds=time.monotonic() - began, consumed_tokens=embeddings.shape[0],
+        measured.update(**artifact, wall_seconds=time.monotonic() - began, consumed_tokens=embeddings.shape[0],
                         final_position=embeddings.shape[0] - 1, mlx_peak_bytes=mx.get_peak_memory())
         return measured
     finally:
@@ -243,12 +313,27 @@ def token_pass(model, embeddings, state, phase, began=None):
         mx.clear_cache()
 
 
+def reference_pass(model, embeddings, state, rope, began):
+    layers = model.model.language_model.layers
+    originals = [layer.self_attn.rope for layer in layers]
+    try:
+        for layer in layers:
+            layer.self_attn.rope = rope
+        result = token_pass(model, embeddings, state, "reference", began=began)
+        save(state / "reference.json", result)
+        return result
+    finally:
+        for layer, original in zip(layers, originals):
+            layer.self_attn.rope = original
+
+
 def worker(state):
     import mlx.core as mx
     import numpy as np
     import torch
     from mlx_audio.stt.utils import load_model
 
+    protocol = read_protocol(state)
     torch.set_num_threads(2)
     started = time.monotonic()
     save(state / "progress.json", {"phase": "setup", "started_monotonic": started})
@@ -279,24 +364,17 @@ def worker(state):
     def reference():
         began = time.monotonic()
         save(state / "progress.json", {"phase": "reference", "started_monotonic": began, "consumed": 0})
-        rope = ReferenceRoPE(TOTAL)
-        layers = model.model.language_model.layers
-        originals = [layer.self_attn.rope for layer in layers]
-        try:
-            for layer in layers:
-                layer.self_attn.rope = rope
-            result = token_pass(model, embeddings, state, "reference", began=began)
-            save(state / "reference.json", result)
-            return result
-        finally:
-            for layer, original in zip(layers, originals):
-                layer.self_attn.rope = original
+        rope = NativeBF16RoPE(TOTAL) if protocol["native_bf16_frequencies"] else ReferenceRoPE(TOTAL, bf16_frequencies=protocol["bf16_frequencies"])
+        save(state / "reference-frequencies.json", rope.frequencies)
+        return reference_pass(model, embeddings, state, rope, began)
 
     save(state / "comparison.json", compare(native, reference))
 
 
 def execute(state):
-    protocol = json.loads((state / "protocol.json").read_text())
+    protocol = read_protocol(state)
+    protocol["hashes"][str(state / "protocol.json")] = (state / "protocol.sha256").read_text().strip()
+    protocol["hashes"][str(state / "protocol.sha256")] = sha256(state / "protocol.sha256")
     if (state / "started.json").exists():
         raise ValueError("Run already attempted; no automatic retry")
     guard = Guard(state, footprint_limit=protocol["limits"]["sampled_footprint_bytes"])
@@ -348,15 +426,20 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state", type=Path, default=STATE)
+    frequency = parser.add_mutually_exclusive_group()
+    frequency.add_argument("--bf16-frequencies", action="store_true", help="Prepare the Torch reference with BF16-rounded inverse frequencies")
+    frequency.add_argument("--native-bf16-frequencies", action="store_true", help="Prepare native MLX RoPE with BF16-rounded inverse frequencies")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--prepare", action="store_true")
     mode.add_argument("--run", action="store_true")
     mode.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if (args.bf16_frequencies or args.native_bf16_frequencies) and not args.prepare:
+        parser.error("Frequency selection is prepare-only; run uses the frozen protocol")
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)
     if args.prepare:
-        protocol = prepare(args.state)
+        protocol = prepare(args.state, bf16_frequencies=args.bf16_frequencies, native_bf16_frequencies=args.native_bf16_frequencies)
         print(json.dumps({"state": str(args.state), "frozen_files": len(protocol["hashes"]), "inference_run": False}))
     elif args.run:
         execute(args.state)

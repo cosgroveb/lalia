@@ -373,7 +373,8 @@ reaped both children, and all 1,484 frozen files remained unchanged.
 on Spark's GB10. It loads unchanged BF16 decoder weights and the tied head,
 uses the same 2,048-token schedule, and validates every layer's cache length.
 It does not encode audio or generate a transcript. The default loader matches
-the published MOSS runner's BF16 cast, including its rotary-frequency buffer.
+the [published MOSS runner's BF16 cast](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize/blob/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/app/model_runner.py#L178-L192),
+including its rotary-frequency buffer.
 `score --fp32-rope` recomputes that buffer from the pinned default initializer
 on CPU after the cast. It verifies unchanged scaling and the original BF16
 round-back hash. Weights and all other computation remain unchanged. Use a
@@ -449,3 +450,71 @@ The environment needs Torch, Transformers 5.17.0, safetensors, wheel 0.48.0
 and packaging 26.0. Tests verify both upstream file hashes before importing
 them. Without `MOSS_OFFICIAL_SOURCE`, only that equivalence test is
 skipped. Acceptance used the fixture: all 42 tests passed with no skips.
+
+## Match the published rotary frequencies
+
+`eos_rope.py --prepare --bf16-frequencies` rounds the reference inverse
+frequencies through BF16 before its existing FP32 trigonometry.
+`--prepare --native-bf16-frequencies` instead uses a MOSS-local wrapper over
+`mx.fast.rope`, with FP32 denominators derived from those same BF16 values.
+Both verify the published runner's frequency hash. The flags are mutually
+exclusive and prepare-only. Omitting them preserves the FP32 reference.
+
+The native wrapper replaces only this model's attention RoPE objects during
+the reference pass, then restores them. It changes neither shared Qwen code
+nor model weights. MLX's native trig and rotation differ from the reference's
+BF16 intermediates, so matching frequencies does not establish exact parity.
+
+Prepare a fresh native-candidate replay from the repository root:
+
+```sh
+state="$HOME/.local/state/lalia-speaker-qualification/eos-native-reproduction"
+/opt/homebrew/opt/omlx/libexec/bin/python -B experiments/speaker-labels/eos_rope.py \
+  --prepare --native-bf16-frequencies --state "$state"
+```
+
+Review the frozen protocol before running the same command with `--run` in
+place of both preparation flags. Selection comes from the hashed protocol.
+Native EOS must reproduce before either alternative runs. The existing
+32 GiB footprint, 300-second pass, 600-second total and 25% battery guards
+remain. Full native-dtype logits and their hashes accompany both summaries.
+Historical runs retain their measured source snapshots and protocol formats.
+
+`native_rope_basis.py --out /private/path/to/fresh-basis-results` checks eight
+small GPU cases without loading weights. It covers single/chunk inputs,
+FP32/BF16 and positions 0/88813 with model-like strides. The fixed 0.02 bound
+detects gross errors, not exact parity. The October 27 cases passed: long
+BF16 basis outputs matched the reference, while maximum FP32 error was
+0.000183. Using inverse frequencies as denominators produced errors near 2.
+
+Measured conditional scores at the same 88,814-input prefix:
+
+| Decoder and rotary calculation | EOS | Continuation 42474 | EOS minus continuation |
+|---|---:|---:|---:|
+| Native MLX | 24.875 | 24.750 | +0.125 |
+| MLX with FP32 reference frequencies | 24.875 | 24.875 | 0 |
+| CUDA with published BF16 frequencies | 21.125 | 28.625 | −7.5 |
+| CUDA with recomputed FP32 frequencies | 24.875 | 24.875 | 0 |
+| MLX reference with BF16 frequencies | 21.125 | 28.5 | −7.375 |
+| Native MLX with BF16-derived denominators | 21.0 | 28.625 | −7.625 |
+
+The BF16-reference run took 68.67 seconds at 24.75 GiB sampled footprint.
+The native candidate run took 64.08 seconds at 25.64 GiB. Its original and
+candidate passes took 27.11 and 27.98 seconds. These are conditional replay
+timings, not full transcription performance. Both native controls reproduced
+the original scores. The later native vector matched the earlier one byte
+for byte. Input/prompt and saved-logit hashes matched, frozen files stayed
+unchanged and owned processes exited.
+
+Frequency precision explains a large change in this stopping decision across
+both runtimes. The candidate still needs complete transcription and speaker
+coverage checks on the saved long audio. No production change is qualified.
+
+Run `test_eos_*.py` as above, then include the native wrapper tests:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 /opt/homebrew/opt/omlx/libexec/bin/python -B \
+  -m unittest discover -s experiments/speaker-labels -p 'test_native_rope.py'
+```
+
+All 28 relevant tests passed: 17 RoPE, eight allocator and three native tests.

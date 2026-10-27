@@ -1,3 +1,5 @@
+import hashlib
+import io
 import json
 from pathlib import Path
 import sys
@@ -100,6 +102,105 @@ class EosRoPETests(unittest.TestCase):
         self.assertAlmostEqual(result["probability_sum"], 1, places=6)
         self.assertAlmostEqual(result["eos_probability"], 1 / (1 + np.exp(-.125)), places=6)
 
+    def test_bf16_frequencies_are_genuinely_rounded_and_match_torch_rotation(self):
+        values = np.random.default_rng(1).normal(size=(1, 2, 4, 128)).astype(np.float32)
+        original_device = mx.default_device()
+        try:
+            for device in (mx.cpu, mx.gpu):
+                mx.set_default_device(device)
+                rounded = probe.ReferenceRoPE(88818, bf16_frequencies=True)
+                default = probe.ReferenceRoPE(88818)
+                self.assertEqual(default.frequencies["stored_dtype"], "torch.float32")
+                self.assertEqual(default.frequencies["stored_sha256"], "138c99b109d7affbfba059e435670918fe4531bce4709b6e86f3f22f7ef80f6e")
+                self.assertEqual(rounded.frequencies["stored_dtype"], "torch.bfloat16")
+                self.assertEqual(rounded.frequencies["stored_sha256"], probe.BF16_FREQUENCY_SHA256)
+                inverse = 1 / (1000000.0 ** (torch.arange(0, 128, 2, dtype=torch.float32) / 128))
+                quantized = inverse.bfloat16().float()
+                self.assertFalse(torch.equal(inverse, quantized))
+                self.assertFalse(np.array_equal(np.array(default.cos[:, :, 88813:88817]), np.array(rounded.cos[:, :, 88813:88817])))
+                for dtype in ("float32", "bfloat16"):
+                    q = torch.from_numpy(values).to(getattr(torch, dtype))
+                    for offset in (0, 71687, 88813):
+                        positions = torch.arange(offset, offset + 4, dtype=torch.float32)
+                        angles = (quantized[None, :, None] @ positions[None, None, :]).transpose(1, 2)
+                        doubled = torch.cat((angles, angles), dim=-1)
+                        expected = q * doubled.cos().to(q.dtype)[:, None] + torch.cat((-q[..., 64:], q[..., :64]), dim=-1) * doubled.sin().to(q.dtype)[:, None]
+                        actual = rounded(mx.array(values).astype(getattr(mx, dtype)), offset=offset)
+                        with self.subTest(device=str(device), dtype=dtype, offset=offset):
+                            np.testing.assert_array_equal(np.array(actual.astype(mx.float32)), expected.float().numpy())
+            with self.assertRaisesRegex(ValueError, "differ from CUDA R7"):
+                probe.ReferenceRoPE(4, base=10000.0, bf16_frequencies=True)
+        finally:
+            mx.set_default_device(original_device)
+            mx.clear_cache()
+
+    def test_frequency_selection_is_in_frozen_protocol(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            for selection in ((False, False), (True, False), (False, True), (True, True), ("true", False), (False, "true")):
+                expected = dict(zip(("bf16_frequencies", "native_bf16_frequencies"), selection))
+                probe.save(state / "protocol.json", expected)
+                (state / "protocol.sha256").write_text(probe.sha256(state / "protocol.json"))
+                if selection in ((False, False), (True, False), (False, True)):
+                    self.assertEqual(probe.read_protocol(state), expected)
+                else:
+                    with self.assertRaisesRegex(ValueError, "Invalid frozen frequency"):
+                        probe.read_protocol(state)
+            probe.save(state / "protocol.json", {"bf16_frequencies": False, "native_bf16_frequencies": False})
+            with self.assertRaisesRegex(ValueError, "Frozen protocol changed"):
+                probe.read_protocol(state)
+
+    def test_frequency_flag_is_prepare_only_and_defaults_to_false(self):
+        for extra in ([], ["--bf16-frequencies"], ["--native-bf16-frequencies"]):
+            with patch.object(sys, "argv", ["eos_rope.py", "--prepare", *extra]), patch.object(probe, "prepare", return_value={"hashes": {}}) as prepare, patch("sys.stdout", new_callable=io.StringIO), patch.object(probe.signal, "signal"):
+                probe.main()
+                prepare.assert_called_once_with(probe.STATE, bf16_frequencies="--bf16-frequencies" in extra,
+                                                native_bf16_frequencies="--native-bf16-frequencies" in extra)
+        for mode in ("--run", "--worker"):
+            for flag in ("--bf16-frequencies", "--native-bf16-frequencies"):
+                with patch.object(sys, "argv", ["eos_rope.py", mode, flag]), patch("sys.stderr", new_callable=io.StringIO), patch.object(probe, "execute") as execute, patch.object(probe, "worker") as worker:
+                    with self.assertRaises(SystemExit) as error:
+                        probe.main()
+                    self.assertEqual(error.exception.code, 2)
+                    execute.assert_not_called()
+                    worker.assert_not_called()
+
+    def test_conflicting_frequency_flags_are_rejected_before_prepare(self):
+        with patch.object(sys, "argv", ["eos_rope.py", "--prepare", "--bf16-frequencies", "--native-bf16-frequencies"]), patch("sys.stderr", new_callable=io.StringIO), patch.object(probe, "prepare") as prepare:
+            with self.assertRaises(SystemExit) as error:
+                probe.main()
+            self.assertEqual(error.exception.code, 2)
+            prepare.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "only one BF16"):
+            probe.prepare(None, bf16_frequencies=True, native_bf16_frequencies=True)
+
+    def test_native_logits_and_hashes_saved_before_summary_failure(self):
+        class Cache:
+            offset = 0
+            state = ()
+
+        def forward(inputs_embeds, cache):
+            cache[0].offset += inputs_embeds.shape[1]
+            return inputs_embeds
+
+        model = Mock()
+        model.make_cache = lambda: [Cache()]
+        model.model.language_model = Mock(side_effect=forward)
+        raw = mx.array([1.25, -0.5, 24.875], dtype=mx.bfloat16)
+        model.lm_head = lambda values: raw[None, None, :]
+        with tempfile.TemporaryDirectory() as temporary, patch.object(probe, "scores", side_effect=ValueError("synthetic summary failure")):
+            state = Path(temporary)
+            with self.assertRaisesRegex(ValueError, "synthetic summary failure"):
+                probe.token_pass(model, mx.zeros((3, 2)), state, "native")
+            artifact = json.loads((state / "native-logits.json").read_text())
+            path = state / artifact["logits_file"]
+            saved = mx.load(str(path))["logits"]
+            self.assertEqual(saved.dtype, mx.bfloat16)
+            np.testing.assert_array_equal(np.array(saved.astype(mx.float32)), np.array(raw.astype(mx.float32)))
+            expected_hash = hashlib.sha256(torch.tensor([1.25, -0.5, 24.875], dtype=torch.bfloat16).view(torch.uint8).numpy().tobytes()).hexdigest()
+            self.assertEqual(artifact["raw_logits_sha256"], expected_hash)
+            self.assertEqual(artifact["logits_file_sha256"], probe.sha256(path))
+
     def test_native_gate_uses_original_dtype_sampler_when_normalization_ties(self):
         logits = mx.zeros((151646,), dtype=mx.bfloat16)
         logits[probe.EOS] = .001
@@ -183,7 +284,8 @@ class EosRoPETests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
-            probe.save(state / "protocol.json", {"hashes": {}, "limits": {"sampled_footprint_bytes": 32 * 1024**3}})
+            probe.save(state / "protocol.json", {"bf16_frequencies": False, "native_bf16_frequencies": False, "hashes": {}, "limits": {"sampled_footprint_bytes": 32 * 1024**3}})
+            (state / "protocol.sha256").write_text(probe.sha256(state / "protocol.json"))
             with patch.object(probe, "power", return_value="test"), patch.object(probe.Guard, "launch", fake_launch):
                 with self.assertRaisesRegex(RuntimeError, "synthetic launch failure"):
                     probe.execute(state)
@@ -197,7 +299,8 @@ class EosRoPETests(unittest.TestCase):
         for returncode in (0, 2):
             with self.subTest(returncode=returncode), tempfile.TemporaryDirectory() as temporary:
                 state = Path(temporary)
-                probe.save(state / "protocol.json", {"hashes": {}, "limits": {"sampled_footprint_bytes": 32 * 1024**3}})
+                probe.save(state / "protocol.json", {"bf16_frequencies": False, "native_bf16_frequencies": False, "hashes": {}, "limits": {"sampled_footprint_bytes": 32 * 1024**3}})
+                (state / "protocol.sha256").write_text(probe.sha256(state / "protocol.json"))
                 probe.save(state / "comparison.json", {"status": "complete"})
                 child = Mock(returncode=returncode)
                 child.poll.return_value = returncode
