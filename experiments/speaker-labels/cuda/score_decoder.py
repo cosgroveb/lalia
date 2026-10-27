@@ -161,8 +161,36 @@ def cuda_smoke(stage="tiny"):
     from smoke_numeric import run_smoke
     return run_smoke(stage)
 
+
+def record_score(model, embeddings, out, metadata):
+    metadata = {**metadata, "expected_consumed": embeddings.shape[0],
+                "expected_final_position": embeddings.shape[0] - 1}
+    (out / "started.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    progress = []
+    def report(row):
+        row.update(available_bytes=available_bytes(), cuda_allocated=torch.cuda.memory_allocated(),
+                   cuda_reserved=torch.cuda.memory_reserved(), cuda_peak=torch.cuda.max_memory_allocated())
+        progress.append(row)
+        (out / "progress.json").write_text(json.dumps(progress, indent=2) + "\n")
+        if row["available_bytes"] < 8 * GIB:
+            raise MemoryError("MemAvailable below 8 GiB")
+    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16), fused_attention():
+        logits, cache = score(model, embeddings, report=report)
+    logits_path = out / "logits.safetensors"
+    save_file({"logits": logits.detach().cpu().contiguous()}, logits_path)
+    consumed = progress[-1]["consumed"]
+    if consumed != cache.get_seq_length() or consumed != embeddings.shape[0]:
+        raise ValueError("Completed progress and cache length disagree")
+    result = {**metadata, **summary(logits), "seconds": progress[-1]["seconds"],
+              "consumed": consumed, "final_position": consumed - 1,
+              "logits_file": logits_path.name, "logits_file_sha256": sha256(logits_path),
+              "peak_cuda_bytes": torch.cuda.max_memory_allocated(), "cache_tokens": cache.get_seq_length()}
+    (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    return result
+
+
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--inputs", type=Path)
     parser.add_argument("--out", type=Path)
     parser.add_argument("--cuda-smoke", action="store_true")
@@ -226,27 +254,9 @@ def main():
                 "rope_original_sha256": original_rope_sha256,
                 "rope_attention_scaling": model.rotary_emb.attention_scaling,
                 "model_revision": manifest["model_revision"], "chunk": CHUNK,
-                "consumed": TOTAL, "final_position": TOTAL - 1,
                 "attn_implementation": config._attn_implementation, "math_sdpa_enabled": False,
                 "loader": "Pinned official ModelRunner BF16 cast, decoder only"}
-    (args.out / "started.json").write_text(json.dumps(metadata, indent=2) + "\n")
-    progress = []
-    def report(row):
-        row.update(available_bytes=available_bytes(), cuda_allocated=torch.cuda.memory_allocated(),
-                   cuda_reserved=torch.cuda.memory_reserved(), cuda_peak=torch.cuda.max_memory_allocated())
-        progress.append(row)
-        (args.out / "progress.json").write_text(json.dumps(progress, indent=2) + "\n")
-        if row["available_bytes"] < 8 * GIB:
-            raise MemoryError("MemAvailable below 8 GiB")
-    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16), fused_attention():
-        logits, cache = score(model, embeddings, report=report)
-    logits_path = args.out / "logits.safetensors"
-    save_file({"logits": logits.detach().cpu().contiguous()}, logits_path)
-    result = {**metadata, **summary(logits), "seconds": progress[-1]["seconds"],
-              "logits_file": logits_path.name, "logits_file_sha256": sha256(logits_path),
-              "peak_cuda_bytes": torch.cuda.max_memory_allocated(), "cache_tokens": cache.get_seq_length()}
-    (args.out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result))
+    print(json.dumps(record_score(model, embeddings, args.out, metadata)))
 
 
 if __name__ == "__main__":

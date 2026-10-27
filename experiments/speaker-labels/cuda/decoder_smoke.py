@@ -147,7 +147,7 @@ def worker():
         raise ValueError("Unexpected Torch/CUDA/Triton runtime")
     initial_available = smoke.require_available(12)
     if torch.cuda.get_device_capability() != (12, 1):
-        raise ValueError("Expected Spark GB10 capability12.1")
+        raise ValueError("Expected Spark GB10 capability 12.1")
     torch.cuda.set_per_process_memory_fraction(1024**3 / torch.cuda.get_device_properties(0).total_memory)
     model, embeddings = fixture()
     if model.rotary_emb.inv_freq.dtype != torch.bfloat16:
@@ -219,6 +219,6 @@ def run(log=Path("/results/decoder-worker.log")):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true")
     print(json.dumps(worker() if parser.parse_args().worker else run(), allow_nan=False))

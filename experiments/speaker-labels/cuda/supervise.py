@@ -216,7 +216,7 @@ class Supervisor:
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("smoke", "shapes", "decoder", "score"))
     parser.add_argument("--root", type=Path, default=Path("/tmp/lalia-moss-cuda-20261027-r4"))
     parser.add_argument("--fp32-rope", action="store_true")

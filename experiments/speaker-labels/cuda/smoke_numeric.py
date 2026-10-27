@@ -167,7 +167,7 @@ def run_smoke(stage="tiny", log=Path("/results/cuda-numeric.log")):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--stage", choices=("tiny", "shapes"), default="tiny")
     args = parser.parse_args()

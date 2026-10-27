@@ -434,6 +434,11 @@ established equivalent, and neither run generated continued transcription.
 
 Run the CUDA diagnostic CPU tests without GPU inference:
 
+Download [configuration_moss_transcribe_diarize.py](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/configuration_moss_transcribe_diarize.py)
+and [modeling_moss_transcribe_diarize.py](https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/resolve/704aa4a9c304e8520be88901e0d1960158ef5b15/modeling_moss_transcribe_diarize.py)
+into one directory, keeping their filenames. Set `MOSS_OFFICIAL_SOURCE` to
+that directory.
+
 ```sh
 OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MOSS_OFFICIAL_SOURCE=/path/to/pinned/moss/source \
   /opt/homebrew/opt/omlx/libexec/bin/python -B -m unittest discover \
@@ -441,7 +446,6 @@ OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MOSS_OFFICIAL_SOURCE=/path/to/pinned/mo
 ```
 
 The environment needs Torch, Transformers 5.17.0, safetensors, wheel 0.48.0
-and packaging 26.0. The external fixture contains the model's official
-configuration and modeling Python files. Tests verify both hashes before
-importing them. Without `MOSS_OFFICIAL_SOURCE`, only that equivalence test is
-skipped. Acceptance used the fixture: all 41 tests passed with no skips.
+and packaging 26.0. Tests verify both upstream file hashes before importing
+them. Without `MOSS_OFFICIAL_SOURCE`, only that equivalence test is
+skipped. Acceptance used the fixture: all 42 tests passed with no skips.

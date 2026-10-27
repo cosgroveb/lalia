@@ -1,9 +1,12 @@
+from contextlib import nullcontext
 import importlib.util
+import json
 import os
 import sys
 import tempfile
 import types
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import torch
@@ -37,6 +40,37 @@ class ProbeTests(unittest.TestCase):
             logits[42] = value
             with self.subTest(value=value), self.assertRaisesRegex(ValueError, "Nonfinite final logits"):
                 probe.summary(logits)
+
+    def test_recording_distinguishes_expected_counts_from_completed_progress(self):
+        embeddings = torch.zeros(13, 16, dtype=torch.bfloat16)
+        for cache_tokens in (None, 12, 13):
+            def score(model, inputs, report):
+                if cache_tokens is None:
+                    raise RuntimeError("synthetic first-chunk failure")
+                report({"consumed": 13, "seconds": 0.1})
+                return torch.zeros(151936, dtype=torch.bfloat16), types.SimpleNamespace(get_seq_length=lambda: cache_tokens)
+
+            with self.subTest(cache_tokens=cache_tokens), tempfile.TemporaryDirectory() as temporary, \
+                    patch.object(probe, "score", side_effect=score), \
+                    patch.object(probe, "fused_attention", side_effect=nullcontext), \
+                    patch.object(torch.amp, "autocast", return_value=nullcontext()), \
+                    patch.object(probe, "available_bytes", return_value=32 * probe.GIB), \
+                    patch.multiple(torch.cuda, memory_allocated=lambda: 0, memory_reserved=lambda: 0, max_memory_allocated=lambda: 0):
+                out = Path(temporary)
+                if cache_tokens is None:
+                    with self.assertRaisesRegex(RuntimeError, "first-chunk failure"):
+                        probe.record_score(None, embeddings, out, {})
+                    self.assertFalse((out / "progress.json").exists())
+                elif cache_tokens == 12:
+                    with self.assertRaisesRegex(ValueError, "progress and cache length disagree"):
+                        probe.record_score(None, embeddings, out, {})
+                else:
+                    result = probe.record_score(None, embeddings, out, {})
+                    self.assertEqual((result["consumed"], result["final_position"], result["cache_tokens"]), (13, 12, 13))
+                    self.assertEqual(json.loads((out / "result.json").read_text()), result)
+                started = json.loads((out / "started.json").read_text())
+                self.assertEqual(started, {"expected_consumed": 13, "expected_final_position": 12})
+                self.assertEqual((out / "result.json").exists(), cache_tokens == 13)
 
     def test_official_loader_cast_changes_rope_buffer(self):
         model = probe.empty_decoder(config())
