@@ -130,3 +130,82 @@ parsed speech at 36m49s, 65.70% cpWER and 66.22% collared DER. It took 476.03s
 at 23.94 GiB peak footprint, with unchanged swap. A separate 60-minute prompt
 diagnostic succeeded, but does not qualify the 90-minute path. Deployment,
 real-device testing and coding-model contention checks remain on hold.
+
+## Short-window diagnostic
+
+Run `window_matching.py` first to test CPU speaker matching on disjoint AMI
+reference clips. It does not test diarization or unknown speakers. Use Python
+3.13.11 in an isolated environment with `numpy==2.4.4`,
+`onnxruntime==1.24.3`, and `kaldi-native-fbank==1.22.3`. The measured transitive
+versions were flatbuffers 25.12.19, mpmath 1.3.0, packaging 26.3, protobuf
+7.36.2, and sympy 1.14.0. No upstream realtime framework is required.
+
+Download `3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx` from
+`csukuangfj/speaker-embedding-models` at revision
+`0743f301363dec56491a490f6d6cbc9d67f9a3bf`. Both scripts require SHA-256
+`f682b514c05d947ee3fa91cd6ec6c5c7543479a128373fa29b1faedccd21fd11`.
+From the repository root in an initialized login shell:
+
+```sh
+matching="$HOME/.local/state/lalia-speaker-qualification/window-matching-20261027"
+manifest="$HOME/.local/state/lalia-speaker-eval-20261025/data/public/manifest.json"
+uv venv --python python3.13 "$matching/venv"
+uv pip install --python "$matching/venv/bin/python" --only-binary :all: \
+  numpy==2.4.4 onnxruntime==1.24.3 kaldi-native-fbank==1.22.3 \
+  flatbuffers==25.12.19 mpmath==1.3.0 packaging==26.3 protobuf==7.36.2 sympy==1.14.0
+curl --fail --location --output "$matching/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx" \
+  https://huggingface.co/csukuangfj/speaker-embedding-models/resolve/0743f301363dec56491a490f6d6cbc9d67f9a3bf/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx
+"$matching/venv/bin/python" -B experiments/speaker-labels/window_matching.py \
+  --manifest "$manifest" --model "$matching/3dspeaker_speech_campplus_sv_zh-cn_16k-common.onnx" \
+  --output /private/path/to/fresh-matching-results --select-only
+```
+
+Review the frozen selection, then repeat without `--select-only`. Completed
+results cannot be overwritten. Only the public `ami-ES2004a-full` clip is used.
+
+`short_windows.py` then tests three fixed windows, [0,390], [330,750], and
+[690,end] seconds, through the existing isolated patched API runtime. Its
+paths name the saved October 26 baseline, prompt, launcher and pins under
+`~/.local/state/lalia-speaker-qualification/official-api-path`. Preparation
+verifies those artifacts and extracts sample-exact PCM. It requires those
+prior local qualification artifacts, not the default installed oMLX launcher.
+Choose a fresh output directory for each attempt. An attempted run cannot
+resume or overwrite its evidence.
+
+```sh
+scoring="$HOME/.local/state/lalia-speaker-eval-20261025/scoring-venv/bin/python"
+windows="$HOME/.local/state/lalia-speaker-qualification/official-api-path/short-windows-reproduction"
+"$scoring" -B experiments/speaker-labels/short_windows.py --state "$windows" --prepare
+"$scoring" -B experiments/speaker-labels/short_windows.py --state "$windows" --run
+```
+
+The run uses port 18001, one server and serial requests with the same literal
+prompt and 49,152-token ceiling. Limits are 300 seconds per request, 600 seconds
+overall, 16 GiB sampled child footprint, and 25% charge on battery. It stops
+and waits for owned children on exit. Audio, raw replies and provenance stay
+in private state.
+
+Matching uses only predicted single-label spans, trims 150 ms, and takes the
+first three seconds from up to two longest distinct usable spans per label.
+First-window normalized means remain frozen. Later labels must meet cosine
+0.55 and map uniquely. Rejection or collision stops the experiment. Seams use
+the nearest midpoint of a shared speech-free gap at least 0.2 seconds long.
+The join keeps whole speech segments and accounts for redundant copies.
+Non-speech events keep their full intervals under midpoint ownership.
+
+Aggregate results compare cpWER and strict/collared DER against the saved
+full-file diagnostic baseline. The regression limit is five percentage points
+for cpWER and collared DER. Reference-position alignment counts seam deletions
+and insertions within 30 seconds of each cut, with overlap/repeated-word
+limitations. Insertions are not proven duplicates. No threshold or boundary
+tuning follows this evaluation. These checks do not qualify 90-minute input,
+new speakers, ambient microphones, or deployment.
+
+The October 27 Stage A probe correctly accepted all 15 held-out oracle clips.
+One of 45 impostor pair scores exceeded 0.55, so the threshold alone does not
+establish unknown-speaker rejection. Stage B's first 390-second request
+completed in 10.10 seconds, with final predicted speech ending at 384.42
+seconds. Enrollment stopped before matching because S03's longest clean span
+left 2.98 seconds after trimming, below the fixed three-second requirement.
+No later window, matching or seam scoring ran. Request completion and the last
+timestamp do not establish full speech coverage or merged accuracy.
