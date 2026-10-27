@@ -11,6 +11,7 @@ import Foundation
     @Published private(set) var diagnostics: [String] = []
     @Published private(set) var recordingElapsed = 0.0
     @Published private(set) var recordingWarning = false
+    @Published private(set) var processing: [UUID: String] = [:]
     let store: SessionStore
     private let recorder: Recording
     private let capture: SessionCapturing
@@ -21,7 +22,15 @@ import Foundation
     private var activeSession: UUID?
     private var lastTranscriptSession: UUID?
     private var dictationSegment: UUID?
-    private var operation: Task<Void, Never>?
+    private var captureOperation: Task<Void, Never>?
+    private enum Work {
+        case transcription(paste: Bool, generation: UUID?), analysis(reprocess: Bool), notes
+    }
+    private struct ProcessingJob { let session: UUID; let work: Work }
+    private var queue: [ProcessingJob] = []
+    private var currentJob: ProcessingJob?
+    private var processingOperation: Task<Void, Never>?
+    private var captureGeneration = UUID()
     private var quitting = false
     private var startingFailure: Error?
     private var recordingActivity: RecordingActivity?
@@ -30,7 +39,8 @@ import Foundation
     private let warningSeconds: Double
     var recordingRemaining: Double { max(0, recordingLimit - recordingElapsed) }
     var available: Bool { !quitting && (phase == .idle || phase == .needsPermission) }
-    var canCancel: Bool { phase == .transcribing || phase == .summarizing }
+    var canCancel: Bool { currentJob != nil }
+    func canProcess(_ id: UUID) -> Bool { !quitting && id != activeSession && processing[id] == nil }
 
     init(recorder: Recording, transcriber: Transcribing, injector: Injecting, authorizer: Authorizing,
          store: SessionStore = SessionStore(), capture: SessionCapturing = SessionCapture(),
@@ -65,6 +75,7 @@ import Foundation
             message = "Microphone and Accessibility permissions are required for dictation."
             return
         }
+        captureGeneration = UUID()
         do {
             let session = try store.create(kind: .dictation)
             activeSession = session.id
@@ -93,9 +104,8 @@ import Foundation
             try recorder.stop()
             try store.finishSegment(id, segmentID: segment)
             try store.update(id) { $0.captureState = .complete }
-            activeSession = nil; dictationSegment = nil
+            activeSession = nil; dictationSegment = nil; phase = .idle
             if transcribe { beginTranscription(id, paste: true) }
-            else { phase = .idle }
         } catch {
             recorder.close()
             recordCaptureFailure(error)
@@ -105,9 +115,10 @@ import Foundation
     }
     func startSession() {
         guard available else { return }
+        captureGeneration = UUID()
         phase = .preparing; message = "Starting microphone and Mac audio…"
         startingFailure = nil
-        operation = Task {
+        captureOperation = Task {
             guard await authorizer.requestMicrophone() else {
                 phase = .idle; message = "Microphone permission is required to start a session."; return
             }
@@ -140,7 +151,7 @@ import Foundation
     func stopSession() {
         guard phase == .recordingSession else { return }
         phase = .stopping; message = "Saving recording…"
-        operation = Task { await finishSession(transcribe: true) }
+        captureOperation = Task { await finishSession(transcribe: true) }
     }
     private func startDeadline(at start: ContinuousClock.Instant) {
         deadline?.cancel()
@@ -174,7 +185,7 @@ import Foundation
         guard activeSession != nil, phase == .recordingSession || phase == .preparing else { return }
         if phase == .preparing { startingFailure = error; return }
         phase = .stopping
-        operation = Task { await finishSession(transcribe: false, failure: error) }
+        captureOperation = Task { await finishSession(transcribe: false, failure: error) }
     }
     private func finishSession(transcribe: Bool, failure: Error? = nil) async {
         guard let id = activeSession else { return }
@@ -189,7 +200,7 @@ import Foundation
         }
         activeSession = nil; phase = .idle
         refreshHistory()
-        if failure == nil, transcribe { await analyzeSession(id, reprocess: false) }
+        if failure == nil, transcribe { beginAnalysis(id, reprocess: false) }
     }
     private func recordCaptureFailure(_ error: Error) {
         message = "Capture failed: \(error.localizedDescription) Saved audio is retained."
@@ -199,26 +210,26 @@ import Foundation
         }
     }
     func retry(_ id: UUID) {
-        guard available else { return }
+        guard canProcess(id) else { return }
         if (try? store.read(id).analysis) != nil { beginAnalysis(id, reprocess: false); return }
         beginTranscription(id, paste: false)
     }
     func reprocess(_ id: UUID) {
-        guard available else { return }
+        guard canProcess(id) else { return }
         beginAnalysis(id, reprocess: true)
     }
     private func beginAnalysis(_ id: UUID, reprocess: Bool) {
-        phase = .transcribing; message = "Preparing conversation audio…"
-        operation = Task { await analyzeSession(id, reprocess: reprocess) }
+        enqueue(id, work: .analysis(reprocess: reprocess))
     }
     private func analyzeSession(_ id: UUID, reprocess: Bool) async {
-        phase = .transcribing; message = "Preparing conversation audio…"
+        processingMessage("Preparing conversation audio…", for: id)
         let activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled], reason: "Lalia analysis \(id)")
-        defer { ProcessInfo.processInfo.endActivity(activity); phase = .idle; refreshHistory() }
+        defer { ProcessInfo.processInfo.endActivity(activity); refreshHistory() }
         do {
+            try Task.checkCancellation()
             var record = try store.recover(id)
             if !reprocess, record.analysis?.attempt?.state == .complete || (record.analysis?.attempt == nil && record.transcriptionComplete) {
-                message = "Transcript already saved. Use Reprocess to replace it."; return
+                processingMessage("Transcript already saved. Use Reprocess to replace it.", for: id); return
             }
             let profile = try (!reprocess ? record.analysis?.attempt?.profile : nil) ?? transcriber.sessionProfile()
             let attempt = SessionAnalysis.Attempt(profile: profile)
@@ -236,7 +247,7 @@ import Foundation
             else {
                 try await transcriber.prepareSession(profile: profile)
                 try Task.checkCancellation()
-                message = "Transcribing conversation with speaker labels…"
+                processingMessage("Transcribing conversation with speaker labels…", for: id)
                 try store.update(id) { $0.analysis?.attempt?.state = .running }
                 let raw = try await transcriber.transcribeSession(store.file(id, input.filename), profile: profile)
                 // Save even a rejected response before interpreting model output.
@@ -247,7 +258,7 @@ import Foundation
                 accepted = try SpeakerTranscript(attempt: saved, duration: input.duration)
             }
             try Task.checkCancellation()
-            message = "Saving speaker transcript…"
+            processingMessage("Saving speaker transcript…", for: id)
             try store.update(id) { record in
                 let active = record.analysis?.active
                 let previousIsLegacy = active == nil && record.hasLegacyTranscript
@@ -259,23 +270,24 @@ import Foundation
             }
             lastTranscript = trimmedTranscript(accepted.transcript)
             lastTranscriptSession = id
-            message = accepted.turns.isEmpty ? "No speech recognized." : "Speaker transcript saved."
+            processingMessage(accepted.turns.isEmpty ? "No speech recognized." : "Speaker transcript saved.", for: id)
         } catch {
-            message = Task.isCancelled ? "Processing cancelled. Audio and previous transcript are retained. oMLX may still be processing; Retry may wait for that request." : error.localizedDescription
+            let failure = Task.isCancelled ? "Processing cancelled. Audio and previous transcript are retained. oMLX may still be processing; Retry may wait for that request." : error.localizedDescription
+            processingMessage(failure, for: id)
             do {
-                let failure = message
                 try store.update(id) { $0.analysis?.attempt?.state = .failed; $0.analysis?.attempt?.error = failure; $0.transcriptionError = failure }
-            } catch { message += " Could not save status: \(error.localizedDescription)" }
+            } catch { processingMessage("\(failure) Could not save status: \(error.localizedDescription)", for: id) }
         }
     }
     private func beginTranscription(_ id: UUID, paste: Bool) {
-        phase = .transcribing; message = "Preparing saved audio…"
-        operation = Task { await transcribeSession(id, paste: paste) }
+        let generation = paste && currentJob == nil && queue.isEmpty ? captureGeneration : nil
+        enqueue(id, work: .transcription(paste: paste, generation: generation))
     }
-    private func transcribeSession(_ id: UUID, paste: Bool) async {
-        phase = .transcribing; message = "Preparing saved audio…"
-        defer { phase = .idle; refreshHistory() }
+    private func transcribeSession(_ id: UUID, paste: Bool, generation: UUID?) async {
+        processingMessage("Preparing saved audio…", for: id)
+        defer { refreshHistory() }
         do {
+            try Task.checkCancellation()
             try store.update(id) { $0.transcriptionError = nil }
             let store = store
             let preparation = Task.detached {
@@ -289,7 +301,7 @@ import Foundation
             if !pending.isEmpty { try await transcriber.prepare() }
             for job in pending {
                 try Task.checkCancellation()
-                message = "Transcribing \(job.source.label)…"
+                processingMessage("Transcribing \(job.source.label)…", for: id)
                 try store.update(id) { record in
                     if let index = record.jobs.firstIndex(where: { $0.id == job.id }) { record.jobs[index].state = .running; record.jobs[index].error = nil }
                 }
@@ -312,52 +324,105 @@ import Foundation
                 refreshHistory()
             }
             record = try store.read(id)
-            guard let transcript = trimmedTranscript(record.plainTranscript) else { message = "No speech recognized."; return }
+            guard let transcript = trimmedTranscript(record.plainTranscript) else { processingMessage("No speech recognized.", for: id); return }
             lastTranscript = transcript
             lastTranscriptSession = id
             if paste {
-                guard authorizer.currentStatus().accessibilityGranted else { message = "Accessibility permission is required to paste."; return }
-                phase = .pasting; message = "Pasting…"
+                guard generation == captureGeneration, available else {
+                    processingMessage("Dictation saved. Use Copy Last Transcript or Recording History.", for: id); return
+                }
+                guard authorizer.currentStatus().accessibilityGranted else { processingMessage("Accessibility permission is required to paste.", for: id); return }
+                processingMessage("Pasting…", for: id)
                 try await injector.inject(transcript)
-                message = "Ready. Hold ⇧⌘D to dictate."
-            } else { message = "Transcript saved." }
+                processingMessage("Ready. Hold ⇧⌘D to dictate.", for: id)
+            } else { processingMessage("Transcript saved.", for: id) }
         } catch {
-            message = Task.isCancelled ? "Processing cancelled. Saved audio and completed transcripts are retained." : error.localizedDescription
-            do { let failure = message; try store.update(id) { $0.transcriptionError = failure } }
-            catch { message += " Could not save status: \(error.localizedDescription)" }
+            let failure = Task.isCancelled ? "Processing cancelled. Saved audio and completed transcripts are retained." : error.localizedDescription
+            processingMessage(failure, for: id)
+            do { try store.update(id) { $0.transcriptionError = failure } }
+            catch { processingMessage("\(failure) Could not save status: \(error.localizedDescription)", for: id) }
         }
     }
     func generateNotes(_ id: UUID) {
-        guard available else { return }
+        enqueue(id, work: .notes)
+    }
+    private func summarize(_ id: UUID) async {
+        defer { refreshHistory() }
         do {
+            try Task.checkCancellation()
             let record = try store.read(id)
             guard record.transcriptionComplete, !record.transcript.isEmpty else { throw LaliaError("Complete transcription before generating notes.") }
-            phase = .summarizing; message = "Generating notes…"
-            operation = Task {
-                defer { phase = .idle; refreshHistory() }
-                do {
-                    let notes = try await transcriber.notes(for: record.transcript)
-                    try Task.checkCancellation()
-                    try store.update(id) { $0.notes = notes; $0.notesError = nil; $0.notesRevision = record.analysis?.active?.revision }
-                    message = "Notes saved."
-                } catch {
-                    message = error.localizedDescription
-                    do { try store.update(id) { $0.notesError = error.localizedDescription } }
-                    catch { message += " Could not save status: \(error.localizedDescription)" }
-                }
-            }
-        } catch { message = error.localizedDescription }
+            processingMessage("Generating notes…", for: id)
+            let notes = try await transcriber.notes(for: record.transcript)
+            try Task.checkCancellation()
+            try store.update(id) { $0.notes = notes; $0.notesError = nil; $0.notesRevision = record.analysis?.active?.revision }
+            processingMessage("Notes saved.", for: id)
+        } catch {
+            let failure = Task.isCancelled ? "Notes cancelled. Saved audio and transcripts are retained." : error.localizedDescription
+            processingMessage(failure, for: id)
+            do { try store.update(id) { $0.notesError = failure } }
+            catch { processingMessage("\(failure) Could not save status: \(error.localizedDescription)", for: id) }
+        }
     }
-    func cancelProcessing() { if canCancel { operation?.cancel() } }
-    func waitForOperation() async { await operation?.value }
+    private func enqueue(_ id: UUID, work: Work) {
+        guard canProcess(id) else { return }
+        processing[id] = "Queued"
+        queue.append(ProcessingJob(session: id, work: work))
+        if available {
+            if case .notes = work { message = "Notes queued." }
+            else { message = "Transcription queued. Audio is saved." }
+        }
+        startNextProcessing()
+    }
+    private func startNextProcessing() {
+        guard !quitting, currentJob == nil, !queue.isEmpty else { return }
+        let job = queue.removeFirst()
+        currentJob = job
+        processingOperation = Task {
+            switch job.work {
+            case .transcription(let paste, let generation): await transcribeSession(job.session, paste: paste, generation: generation)
+            case .analysis(let reprocess): await analyzeSession(job.session, reprocess: reprocess)
+            case .notes: await summarize(job.session)
+            }
+            processing.removeValue(forKey: job.session)
+            currentJob = nil; processingOperation = nil
+            startNextProcessing()
+        }
+    }
+    private func processingMessage(_ value: String, for id: UUID) {
+        processing[id] = value
+        if available { message = value }
+    }
+    func cancelProcessing(_ id: UUID? = nil) {
+        guard let id = id ?? currentJob?.session else { return }
+        if currentJob?.session == id { processingOperation?.cancel(); return }
+        guard let index = queue.firstIndex(where: { $0.session == id }) else { return }
+        let job = queue.remove(at: index)
+        processing.removeValue(forKey: id)
+        let failure = "Processing cancelled before starting. Saved audio and transcripts are retained."
+        do {
+            try store.update(id) {
+                if case .notes = job.work { $0.notesError = failure }
+                else { $0.transcriptionError = failure }
+            }
+        } catch { if available { message = "Could not save cancellation: \(error.localizedDescription)" } }
+        refreshHistory()
+    }
+    func waitForOperation() async {
+        await captureOperation?.value
+        while let processingOperation { await processingOperation.value }
+    }
     func shutdown() async {
         quitting = true
         deadline?.cancel(); deadline = nil
-        if phase == .preparing { await operation?.value }
+        if phase == .preparing { await captureOperation?.value }
         if phase == .recording { finishDictation(transcribe: false) }
         if phase == .recordingSession { phase = .stopping; await finishSession(transcribe: false) }
-        operation?.cancel()
-        await operation?.value
+        captureOperation?.cancel()
+        await captureOperation?.value
+        for job in queue { cancelProcessing(job.session) }
+        processingOperation?.cancel()
+        await processingOperation?.value
     }
     func export(_ id: UUID, to url: URL) {
         do { try store.export(id, to: url); message = "Transcript exported." }
@@ -368,12 +433,18 @@ import Foundation
         catch { message = error.localizedDescription }
     }
     func restoreTranscript(_ id: UUID) {
-        guard available else { return }
+        guard canProcess(id) else { return }
         do { try store.restoreTranscript(id); try refreshLastTranscript(id); message = "Previous transcript restored."; refreshHistory() }
         catch { message = error.localizedDescription }
     }
     private func refreshLastTranscript(_ id: UUID) throws {
         if lastTranscriptSession == id { lastTranscript = trimmedTranscript(try store.read(id).plainTranscript) }
+    }
+    func copyTranscript(_ id: UUID) {
+        do {
+            guard let transcript = trimmedTranscript(try store.read(id).plainTranscript) else { throw LaliaError("No transcript to copy.") }
+            try injector.copy(transcript); message = "Copied transcript."
+        } catch { message = error.localizedDescription }
     }
     func copyLastTranscript() { if let lastTranscript { do { try injector.copy(lastTranscript); message = "Copied last transcript." } catch { message = error.localizedDescription } } }
     func hotkeyRegistrationFailed(_ error: Error, shortcut: Shortcut) {

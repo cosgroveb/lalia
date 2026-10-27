@@ -5,6 +5,159 @@ import Testing
 @testable import Lalia
 
 @Suite(.serialized) @MainActor struct DictationCoordinatorTests {
+    @Test func transcriptionAllowsNewCaptureAndDoesNotChangeItsPhase() async throws {
+        for session in [false, true] {
+            let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)
+            await test.coordinator.enableDictation()
+            test.transcriber.suspend = true
+            test.coordinator.reprocess(saved.id)
+            while !test.transcriber.waiting { await Task.yield() }
+            if session { test.coordinator.startSession() }
+            else { test.coordinator.hotkeyPressed() }
+            for _ in 0..<20 { await Task.yield() }
+            let expected: Phase = session ? .recordingSession : .recording
+            #expect(test.coordinator.phase == expected)
+            test.transcriber.resume()
+            await test.coordinator.waitForOperation()
+            #expect(test.coordinator.phase == expected)
+            #expect(try test.storage.store.read(saved.id).transcriptionComplete)
+            await test.coordinator.shutdown()
+        }
+    }
+    @Test func queuesDictationWithoutPastingAndKeepsResultsWithTheirRecordings() async throws {
+        let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)
+        await test.coordinator.enableDictation()
+        test.transcriber.suspend = true
+        test.coordinator.reprocess(saved.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        let dictation = try #require(test.coordinator.sessions.first { $0.kind == .dictation })
+        #expect(test.coordinator.processing[dictation.id] == "Queued")
+        test.coordinator.retry(dictation.id)
+        #expect(test.coordinator.processing.count == 2)
+        #expect(test.transcriber.transcriptionCalls == 0)
+        test.coordinator.startSession()
+        while test.coordinator.phase == .preparing { await Task.yield() }
+        test.transcriber.output = "first recording"
+        test.transcriber.resume()
+        while test.transcriber.transcriptionCalls == 0 { await Task.yield() }
+        #expect(try test.storage.store.read(saved.id).transcript.contains("first recording"))
+        #expect(try !test.storage.store.read(dictation.id).transcriptionComplete)
+        #expect(test.coordinator.phase == .recordingSession)
+        test.transcriber.output = "queued dictation"
+        test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.processing.isEmpty)
+        #expect(test.coordinator.phase == .recordingSession)
+        #expect(try test.storage.store.read(dictation.id).plainTranscript == "queued dictation")
+        #expect(try test.storage.store.read(saved.id).transcript.contains("first recording"))
+        #expect(test.injector.injected.isEmpty)
+        #expect(test.injector.copied.isEmpty)
+        test.coordinator.copyLastTranscript()
+        #expect(test.injector.copied == ["queued dictation"])
+        test.coordinator.copyTranscript(saved.id)
+        #expect(test.injector.copied.last?.contains("first recording") == true)
+        await test.coordinator.shutdown()
+    }
+    @Test func newCaptureInvalidatesPendingPasteAndLaterImmediateDictationCanPaste() async throws {
+        let test = CoordinatorFixture()
+        await test.coordinator.enableDictation()
+        test.transcriber.suspend = true
+        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.hotkeyPressed()
+        test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.phase == .recording)
+        #expect(test.injector.injected.isEmpty)
+        #expect(test.injector.copied.isEmpty)
+        test.transcriber.suspend = false
+        test.transcriber.output = "new dictation"
+        test.coordinator.hotkeyReleased()
+        await test.coordinator.waitForOperation()
+        #expect(test.injector.injected == ["new dictation"])
+        #expect(test.coordinator.lastTranscript == "new dictation")
+    }
+    @Test func cancelsQueuedWorkWithoutCancellingRunningRequestAndCanRetry() async throws {
+        let test = CoordinatorFixture()
+        let first = try savedAudio(test.storage.store); let second = try savedAudio(test.storage.store)
+        test.transcriber.suspend = true
+        test.coordinator.reprocess(first.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.reprocess(second.id)
+        test.coordinator.cancelProcessing(second.id)
+        #expect(test.coordinator.processing[second.id] == nil)
+        #expect(test.coordinator.canCancel)
+        #expect(try test.storage.store.read(second.id).transcriptionError?.contains("cancelled before starting") == true)
+        test.transcriber.suspend = false; test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(try test.storage.store.read(first.id).transcriptionComplete)
+        test.coordinator.reprocess(second.id)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 2)
+        #expect(try test.storage.store.read(second.id).transcriptionComplete)
+        #expect(try test.storage.store.read(second.id).transcriptionError == nil)
+    }
+    @Test func shutdownSavesCaptureAndCancelsRunningAndQueuedWork() async throws {
+        let test = CoordinatorFixture()
+        let first = try savedAudio(test.storage.store); let second = try savedAudio(test.storage.store)
+        test.transcriber.suspend = true
+        test.coordinator.reprocess(first.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.reprocess(second.id)
+        test.coordinator.startSession()
+        while test.coordinator.phase == .preparing { await Task.yield() }
+        let captured = try #require(test.coordinator.sessions.first { $0.captureState == .recording })
+        let shutdown = Task { await test.coordinator.shutdown() }
+        while test.capture.stopCalls == 0 { await Task.yield() }
+        #expect(try test.storage.store.read(captured.id).captureState == .complete)
+        #expect(test.coordinator.processing[second.id] == nil)
+        test.transcriber.resume()
+        await shutdown.value
+        #expect(test.coordinator.processing.isEmpty)
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(try test.storage.store.read(first.id).analysis?.attempt?.state == .failed)
+        #expect(try test.storage.store.read(second.id).transcriptionError?.contains("cancelled") == true)
+        #expect(try test.storage.store.read(captured.id).analysis?.attempt == nil)
+        #expect(try sleepAssertions(for: captured.id).isEmpty)
+        let recovered = try test.storage.store.history(recover: true).records
+        #expect(recovered.allSatisfy { $0.segments.allSatisfy(\.complete) })
+    }
+    @Test func cancellingCurrentRequestAdvancesQueueWithoutCancellingNextRequest() async throws {
+        let test = CoordinatorFixture()
+        let first = try savedAudio(test.storage.store); let second = try savedAudio(test.storage.store)
+        test.transcriber.suspend = true
+        test.coordinator.reprocess(first.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.reprocess(second.id)
+        test.coordinator.cancelProcessing(first.id)
+        test.transcriber.resume()
+        while test.transcriber.sessionCalls < 2 { await Task.yield() }
+        #expect(try test.storage.store.read(first.id).analysis?.attempt?.state == .failed)
+        #expect(test.coordinator.processing[first.id] == nil)
+        #expect(test.coordinator.processing[second.id] != nil)
+        test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        #expect(try test.storage.store.read(second.id).transcriptionComplete)
+        #expect(test.coordinator.processing.isEmpty)
+    }
+    @Test func notesFinishDuringCaptureAndEditsStillMakeThemStale() async throws {
+        let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)
+        test.coordinator.reprocess(saved.id); await test.coordinator.waitForOperation()
+        test.transcriber.suspend = true
+        test.coordinator.generateNotes(saved.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.startSession()
+        while test.coordinator.phase == .preparing { await Task.yield() }
+        test.coordinator.editTranscript(saved.id) { try $0.rename("S01", to: "Brian") }
+        test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        #expect(try test.storage.store.read(saved.id).notes == "notes")
+        #expect(try test.storage.store.read(saved.id).notesStale)
+        #expect(test.coordinator.phase == .recordingSession)
+        await test.coordinator.shutdown()
+    }
     @Test func stopsPlaybackSynchronouslyBeforeEitherCaptureStarts() async throws {
         for session in [false, true] {
             let test = CoordinatorFixture()
@@ -411,22 +564,26 @@ import Testing
         #expect(try test.storage.store.read(saved.id).notes == "notes")
         #expect(try test.storage.store.read(saved.id).transcript == transcript)
     }
-    @Test func cancellationKeepsFilesAndExcludesCaptureDuringInference() async throws {
+    @Test func cancellationKeepsFilesWithoutStoppingNewCapture() async throws {
         let test = CoordinatorFixture()
         let saved = try savedAudio(test.storage.store)
         test.transcriber.suspend = true
         test.coordinator.retry(saved.id)
         while !test.transcriber.waiting { await Task.yield() }
         test.coordinator.toggleRecording(); test.coordinator.hotkeyPressed(); test.coordinator.generateNotes(saved.id)
-        #expect(test.capture.startCalls == 0)
+        for _ in 0..<20 { await Task.yield() }
+        #expect(test.capture.startCalls == 1)
         #expect(test.recorder.startCalls == 0)
-        #expect(test.coordinator.phase == .transcribing)
+        #expect(test.coordinator.phase == .recordingSession)
         test.coordinator.cancelProcessing()
         test.transcriber.resume()
         await test.coordinator.waitForOperation()
-        #expect(test.coordinator.message.contains("cancelled"))
+        #expect(test.coordinator.phase == .recordingSession)
+        #expect(test.capture.stopCalls == 0)
+        #expect(try test.storage.store.read(saved.id).transcriptionError?.contains("cancelled") == true)
         #expect(try test.storage.store.read(saved.id).jobs[0].state == .failed)
         #expect(try test.storage.store.read(saved.id).segments[0].complete)
+        await test.coordinator.shutdown()
     }
     @Test func copyFailuresAndHotkeyRegistrationRemainVisible() async {
         let test = CoordinatorFixture()
@@ -549,7 +706,12 @@ private final class TestRecorder: Recording {
             segments: [.init(start: 0, end: duration, text: "[S01] \(output)", speakerID: "S01")],
             usage: .init(type: "tokens", inputTokens: 100, outputTokens: 10, totalTokens: 110)))
     }
-    func notes(for transcript: String) async throws -> String { notesInput = transcript; if let notesError { throw notesError }; return "notes" }
+    func notes(for transcript: String) async throws -> String {
+        notesInput = transcript
+        if suspend { waiting = true; await withCheckedContinuation { continuation = $0 }; waiting = false }
+        if let notesError { throw notesError }
+        return "notes"
+    }
 }
 
 @MainActor private final class TestInjector: Injecting {

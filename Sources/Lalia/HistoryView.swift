@@ -22,25 +22,27 @@ struct HistoryView: View {
                         if let error = session.captureError { Text(error).foregroundStyle(.red) }
                         if let error = session.transcriptionError { Text(error).foregroundStyle(.red) }
                         if session.endedAtLimit == true { Text("Recording stopped at the 90-minute limit.").foregroundStyle(.secondary) }
-                        if let attempt = session.analysis?.attempt, attempt.state == .preparing || attempt.state == .running {
-                            Text("Speaker analysis: \(attempt.state.rawValue)").foregroundStyle(.secondary)
+                        if let status = coordinator.processing[session.id] {
+                            Text(status).foregroundStyle(.secondary)
+                            Button("Cancel Processing") { coordinator.cancelProcessing(session.id) }
                         }
                         ForEach(session.segments.filter { $0.error != nil }) { segment in Text(segment.error ?? "").foregroundStyle(.red) }
                         ForEach(session.jobs.filter { $0.error != nil }) { job in Text(job.error ?? "").foregroundStyle(.red) }
                         HStack {
-                            Button("Retry Transcription") { coordinator.retry(session.id) }.disabled(!coordinator.available || session.captureState == .recording)
+                            Button("Retry Transcription") { coordinator.retry(session.id) }.disabled(!coordinator.canProcess(session.id) || session.captureState == .recording)
                             if session.kind == .session {
                                 Button(session.analysis?.active == nil ? "Add Speaker Labels" : "Reprocess Speaker Labels") { coordinator.reprocess(session.id) }
-                                    .disabled(!coordinator.available || session.captureState == .recording || session.duration > SessionTranscriptionProfile.maximumDuration)
+                                    .disabled(!coordinator.canProcess(session.id) || session.captureState == .recording || session.duration > SessionTranscriptionProfile.maximumDuration)
                             }
                             Button("Export TXT") { export(session) }.disabled(session.transcript.isEmpty)
+                            Button("Copy Transcript") { coordinator.copyTranscript(session.id) }.disabled(session.transcript.isEmpty)
                             Button("Reveal Recordings") { NSWorkspace.shared.open(coordinator.store.directory(session.id)) }
                         }
                         if session.duration > SessionTranscriptionProfile.maximumDuration {
                             Text("Speaker labels support recordings up to 90 minutes. Original audio and existing transcripts remain available.").foregroundStyle(.secondary)
                         }
                         if session.analysis?.previous != nil || session.analysis?.previousIsLegacy == true {
-                            Button("Restore Previous Transcript") { playback.stop(); coordinator.restoreTranscript(session.id) }.disabled(!coordinator.available)
+                            Button("Restore Previous Transcript") { playback.stop(); coordinator.restoreTranscript(session.id) }.disabled(!coordinator.canProcess(session.id))
                         }
                         Text(session.transcriptionComplete ? "Transcript" : "Transcript (incomplete)").font(.headline)
                         if let transcript = session.analysis?.active {
@@ -79,7 +81,7 @@ struct HistoryView: View {
                             if transcript.turns.isEmpty { Text("No speech recognized.") }
                         } else { Text(session.transcript.isEmpty ? "No transcript yet." : session.transcript).textSelection(.enabled) }
                         Button("Generate Notes") { coordinator.generateNotes(session.id) }
-                            .disabled(!coordinator.available || !session.transcriptionComplete || session.transcript.isEmpty)
+                            .disabled(!coordinator.canProcess(session.id) || !session.transcriptionComplete || session.transcript.isEmpty)
                         if let error = session.notesError { Text(error).foregroundStyle(.red) }
                         if session.notesStale { Text("Notes are stale after transcript changes. Generate notes again.").foregroundStyle(.orange) }
                         if let notes = session.notes { Text("Generated notes").font(.headline); Text(notes).textSelection(.enabled) }

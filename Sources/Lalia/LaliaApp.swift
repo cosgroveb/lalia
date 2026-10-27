@@ -109,7 +109,8 @@ private struct LaliaMenu: View {
             Button("Enable Dictation") { Task { await coordinator.enableDictation() } }.disabled(!coordinator.available)
         }
         RecordingButton(coordinator: coordinator)
-        if coordinator.canCancel { Button("Cancel Processing") { coordinator.cancelProcessing() } }
+        if !coordinator.processing.isEmpty { Text("\(coordinator.processing.count) recordings queued or processing") }
+        if coordinator.canCancel { Button("Cancel Current Processing") { coordinator.cancelProcessing() } }
         Button("Recording History") { coordinator.refreshHistory(); openWindow(id: "history"); NSApp.activate() }
         Button("Copy Last Transcript") { coordinator.copyLastTranscript() }.disabled(coordinator.lastTranscript == nil)
         Divider()

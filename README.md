@@ -71,8 +71,20 @@ again to stop, save, and transcribe. The menu and history window offer the same
 release the shortcut. Lalia shows elapsed and remaining time, warns with five
 minutes remaining, then saves and transcribes at 90 minutes. It does not start
 another recording. Holding the shortcut does not toggle repeatedly. Lalia
-ignores the toggle while starting, saving, dictating, or processing. Use
+ignores the toggle while starting, saving, or dictating. Use
 headphones to reduce Mac playback leaking into the microphone.
+
+You can start another recording or dictate while earlier audio is transcribing.
+Lalia processes transcription and notes requests one at a time and shows each
+recording's queued or running status in History. Cancel an individual request
+there, or use `Cancel Current Processing` in the menu. Cancellation leaves an
+active recording running. Quitting saves active capture and cancels queued work,
+which you can retry from History after reopening.
+
+Dictation queued behind another request saves its text without pasting or
+changing the clipboard. Use `Copy Transcript` in History or `Copy Last Transcript`
+in the menu. Immediate dictation still pastes when it finishes, unless you have
+started another capture in the meantime.
 
 Lalia keeps the Mac and display awake during session recording because display
 sleep interrupts ScreenCaptureKit audio capture. Stopping, capture failure, or

@@ -28,7 +28,7 @@ struct AuthorizationStatus: Equatable {
     func requestMicrophone() async -> Bool
 }
 
-enum Phase: Equatable { case needsPermission, preparing, idle, recording, recordingSession, stopping, transcribing, pasting, summarizing }
+enum Phase: Equatable { case needsPermission, preparing, idle, recording, recordingSession, stopping }
 
 func trimmedTranscript(_ text: String) -> String? {
     let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
