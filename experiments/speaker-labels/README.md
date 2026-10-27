@@ -245,3 +245,124 @@ scoring="$HOME/.local/state/lalia-speaker-eval-20261025/scoring-venv/bin/python"
 PYTHONPATH=experiments/speaker-labels "$scoring" -B -m unittest \
   test_score test_run test_qualification test_short_windows
 ```
+
+## Frozen-prefix RoPE diagnostic
+
+Compare next-token scores at the observed 90-minute early EOS with
+`eos_rope.py`. Preparation hashes the public audio, saved token prefix,
+model, isolated runtime, operator binaries, and production files. It does
+not load model weights. Run preparation with the oMLX Python environment:
+
+```sh
+/opt/homebrew/opt/omlx/libexec/bin/python -B experiments/speaker-labels/eos_rope.py --prepare
+```
+
+Review the driver and the resulting
+`~/.local/state/lalia-speaker-qualification/eos-rope-20261027/protocol.json`
+before running `--run` with the same command. The run builds audio/prompt
+embeddings once, appends the saved 17,127 generated tokens, and consumes
+all 88,814 inputs. The final query occupies position 88,813. Each pass uses
+2,048-token chunks followed by one final token.
+
+The installed sampler (including normalization in the original dtype) must
+select EOS 151645. Raw-logit argmax and FP32 probabilities are separate
+diagnostics. Otherwise the probe records
+`native_control_not_reproduced` and stops, since chunked replay can change
+numerics. After releasing its KV cache, the reference pass reuses the
+embeddings with Torch CPU FP32 RoPE frequencies and trigonometry. Evaluated
+products preserve Torch eager BF16 rounding. Tiny tests verify exact
+rotation equality on MLX CPU and GPU. This compares one operator, not full
+Transformers backend parity or transcription accuracy.
+
+The supervisor enforces 300 seconds per pass (including reference-table
+preparation), 600 seconds overall, a sampled 32 GiB child footprint, and a
+25% battery cutoff. It stops and waits for its worker and awake process.
+`result.json` records numeric token scores, timing, sampled footprint and
+the final frozen-file check. No generated text or second live KV cache is
+needed. An attempted state directory cannot run again automatically.
+
+Run both probe test suites without loading model weights:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 /opt/homebrew/opt/omlx/libexec/bin/python -B \
+  -m unittest discover -s experiments/speaker-labels -p 'test_eos_*.py'
+```
+
+The October 27 attempt stopped at the 32 GiB guard after 10.93 seconds.
+The sampled peak was 34.25 GiB. Audio/prompt setup took 6.80 seconds, and
+native replay consumed 22,528 of 88,814 inputs. No final native score or
+reference comparison exists. The supervisor reaped both children and
+verified the frozen production/input files unchanged. It did not retry.
+
+That attempt cleared MLX's allocator cache after each pass. Installed
+generation clears it after each prefill chunk. That difference may explain
+the diagnostic's memory growth. This failed replay establishes neither MOSS's
+required memory nor a connection between RoPE and premature EOS. The state
+directory retains the measured source snapshot, protocol, memory samples,
+and cleanup verification.
+
+### Allocator follow-up
+
+`eos_allocator.py` isolates per-chunk allocator clearing with two fresh
+native workers. Both rebuild and hash the full frozen input embeddings,
+then consume exactly eight 2,048-token chunks (16,384 inputs). Worker A
+keeps the existing allocation policy. Worker B adds `mx.clear_cache()`
+after each chunk. Neither computes final logits or generates tokens.
+
+Each worker records synchronized MLX active/cache/peak bytes, physical
+footprint, and logical/allocated KV bytes. A terminal clear records the
+same quantities before and after, with no subsequent model computation.
+The final hidden-state digests must match. Worker A saves and validates
+the full BF16 embeddings after measurements for possible later reuse.
+
+Prepare `eos-allocator-20261027` with the command below, then review its
+driver and protocol before replacing `--prepare` with `--run`. Either
+worker failing, reaching a guard, or producing different inputs/hidden
+states stops the comparison. Limits are 30 seconds per worker, 60 seconds
+overall, 32 GiB sampled physical footprint, and 25% battery.
+
+```sh
+/opt/homebrew/opt/omlx/libexec/bin/python -B experiments/speaker-labels/eos_allocator.py --prepare
+```
+
+The October 27 allocator A/B completed in 19.66 seconds with identical
+input and final-hidden digests. A's terminal clear reduced physical
+footprint from 27.40 to 9.10 GiB and cached allocation from 18.74 GiB to
+zero. Active allocation stayed at 3.62 GiB, including 1.75 GiB of KV
+storage. B peaked at 19.82 GiB physical footprint and ended at 9.98 GiB.
+The measured prefixes took 0.995 seconds (A) and 1.104 seconds (B).
+
+This establishes allocator retention at 16,384 inputs. It does not test
+the long-prefix EOS decision. Both workers exited successfully, cleanup
+reaped all children, and all 1,504 frozen files remained unchanged. The
+state directory includes the validated BF16 embedding artifact for a
+separately reviewed follow-up.
+
+The corrected replay adds one allocator clear after every evaluated chunk.
+`eos-rope-cleared-20261027` retains the same re-encoded inputs, 2,048-token
+schedule, native EOS requirement, conditional reference pass, and resource
+limits. It does not reuse the saved embeddings. This command prepared its
+state for independent review:
+
+```sh
+/opt/homebrew/opt/omlx/libexec/bin/python -B experiments/speaker-labels/eos_rope.py \
+  --state "$HOME/.local/state/lalia-speaker-qualification/eos-rope-cleared-20261027" --prepare
+```
+
+Completed protocols and results remain unchanged. Their source snapshots
+retain the measured code. Historical verification maps original source
+paths through those manifests, so later edits cannot substitute current
+code for a completed experiment.
+
+The corrected October 27 replay completed in 65.05 seconds at a sampled
+peak physical footprint of 25.69 GiB. Native replay consumed all 88,814
+inputs in 25.97 seconds and selected EOS 151645. EOS scored 24.875 versus
+24.75 for continuation 42474, a 0.125 margin (53.12% versus 46.88%).
+
+Reference RoPE took 30.34 seconds and selected continuation 42474 through
+an exact BF16 tie: both tokens scored 24.875, about 50% each. EOS's score
+did not change. The continuation rose one BF16 step, and the lower token
+ID won the tie. This establishes sensitivity to RoPE operator numerics at
+the frozen prefix. It does not establish a robust fix or completed
+transcription. The full input digest matched the earlier attempt, cleanup
+reaped both children, and all 1,484 frozen files remained unchanged.

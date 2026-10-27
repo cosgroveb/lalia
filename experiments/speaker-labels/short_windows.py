@@ -320,8 +320,9 @@ def deadline(*_):
 
 
 class Guard:
-    def __init__(self, state):
+    def __init__(self, state, footprint_limit=16 * 1024**3):
         self.state, self.started, self.children, self.samples = state, time.monotonic(), [], []
+        self.footprint_limit = footprint_limit
         self.last_power = -10
 
     def launch(self, command, log, **kwargs):
@@ -345,8 +346,8 @@ class Guard:
                 if child.poll() is None:
                     raise
         self.samples.append({"seconds": elapsed, "footprint_bytes": used})
-        if used > 16 * 1024**3:
-            raise MemoryError("Combined child footprint exceeded 16GiB")
+        if used > self.footprint_limit:
+            raise MemoryError(f"Combined child footprint exceeded {self.footprint_limit / 1024**3:g}GiB")
         if elapsed - self.last_power >= 10:
             power()
             self.last_power = elapsed
