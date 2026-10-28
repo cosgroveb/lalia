@@ -1,0 +1,5 @@
+numpy==2.3.5
+packaging==26.0
+torch==2.14.1+cu130
+transformers==5.17.0
+safetensors==0.8.0

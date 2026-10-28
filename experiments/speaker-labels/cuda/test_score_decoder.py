@@ -34,6 +34,36 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(sum(b - a for a, b in parts), 88814)
         self.assertTrue(all(left[1] == right[0] for left, right in zip(parts, parts[1:])))
 
+    def test_exact_prefix_preserves_count_chunk_and_final_singleton(self):
+        parts = probe.chunks(probe.EXACT_TOTAL, probe.EXACT_CHUNK)
+        self.assertEqual(parts[0], (0, 4096))
+        self.assertEqual(parts[-1], (101134, 101135))
+        self.assertEqual(sum(b - a for a, b in parts), 101135)
+        self.assertTrue(all(left[1] == right[0] for left, right in zip(parts, parts[1:])))
+
+    def test_continuation_margin_excludes_both_terminal_ids(self):
+        logits = torch.zeros(151936, dtype=torch.bfloat16)
+        logits[probe.EOS], logits[151643], logits[42] = 5, 4, 3
+        result = probe.summary(logits)
+        self.assertEqual(result["best_non_eos_id"], 42)
+        self.assertEqual(result["eos_margin"], 2)
+
+    def test_requested_profile_must_match_manifest_before_cuda_setup(self):
+        for exact, manifest in ((True, {}), (False, {"score_profile": "exact-prefix"})):
+            with self.subTest(exact=exact), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                (root / "manifest.json").write_text(json.dumps(manifest))
+                argv = ["score_decoder.py", "--inputs", str(root), "--out", str(root / "out")]
+                if exact:
+                    argv.append("--exact-prefix")
+                with patch.object(sys, "argv", argv), patch.object(probe, "verify_runtime", return_value={}), \
+                        patch.object(probe, "available_bytes", return_value=32 * probe.GIB), \
+                        patch.object(torch.cuda, "set_per_process_memory_fraction") as cuda_setup:
+                    with self.assertRaisesRegex(ValueError, "score profile differs"):
+                        probe.main()
+                cuda_setup.assert_not_called()
+                self.assertFalse((root / "out").exists())
+
     def test_final_logits_reject_nonfinite_values(self):
         for value in (float("nan"), float("inf"), -float("inf")):
             logits = torch.zeros(151936, dtype=torch.bfloat16)
@@ -44,7 +74,8 @@ class ProbeTests(unittest.TestCase):
     def test_recording_distinguishes_expected_counts_from_completed_progress(self):
         embeddings = torch.zeros(13, 16, dtype=torch.bfloat16)
         for cache_tokens in (None, 12, 13):
-            def score(model, inputs, report):
+            def score(model, inputs, report, chunk_size):
+                self.assertEqual(chunk_size, probe.EXACT_CHUNK)
                 if cache_tokens is None:
                     raise RuntimeError("synthetic first-chunk failure")
                 report({"consumed": 13, "seconds": 0.1})
@@ -59,13 +90,13 @@ class ProbeTests(unittest.TestCase):
                 out = Path(temporary)
                 if cache_tokens is None:
                     with self.assertRaisesRegex(RuntimeError, "first-chunk failure"):
-                        probe.record_score(None, embeddings, out, {})
+                        probe.record_score(None, embeddings, out, {}, chunk_size=probe.EXACT_CHUNK)
                     self.assertFalse((out / "progress.json").exists())
                 elif cache_tokens == 12:
                     with self.assertRaisesRegex(ValueError, "progress and cache length disagree"):
-                        probe.record_score(None, embeddings, out, {})
+                        probe.record_score(None, embeddings, out, {}, chunk_size=probe.EXACT_CHUNK)
                 else:
-                    result = probe.record_score(None, embeddings, out, {})
+                    result = probe.record_score(None, embeddings, out, {}, chunk_size=probe.EXACT_CHUNK)
                     self.assertEqual((result["consumed"], result["final_position"], result["cache_tokens"]), (13, 12, 13))
                     self.assertEqual(json.loads((out / "result.json").read_text()), result)
                 started = json.loads((out / "started.json").read_text())

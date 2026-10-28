@@ -18,6 +18,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3Model
 GIB = 1024**3
 TOTAL = 88814
 CHUNK = 2048
+EXACT_TOTAL, EXACT_CHUNK = 101135, 4096
 EOS = 151645
 R7_ROPE_SHA256 = "fb39dde72a24bd6b8b3573c5e6375d3f163568c8649e0e97f9fd27ef52f0a493"
 PREFIX = "model.language_model."
@@ -122,7 +123,7 @@ def summary(logits):
     raw = logits.float().cpu()
     best = int(raw.argmax())
     alternative = raw.clone()
-    alternative[EOS] = -torch.inf
+    alternative[[151643, EOS]] = -torch.inf
     non_eos = int(alternative.argmax())
     top = torch.argsort(raw, descending=True, stable=True)[:10]
     return {"argmax": best, "eos": float(raw[EOS]), "best_non_eos_id": non_eos,
@@ -162,7 +163,7 @@ def cuda_smoke(stage="tiny"):
     return run_smoke(stage)
 
 
-def record_score(model, embeddings, out, metadata):
+def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK):
     metadata = {**metadata, "expected_consumed": embeddings.shape[0],
                 "expected_final_position": embeddings.shape[0] - 1}
     (out / "started.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -175,7 +176,7 @@ def record_score(model, embeddings, out, metadata):
         if row["available_bytes"] < 8 * GIB:
             raise MemoryError("MemAvailable below 8 GiB")
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16), fused_attention():
-        logits, cache = score(model, embeddings, report=report)
+        logits, cache = score(model, embeddings, report=report, chunk_size=chunk_size)
     logits_path = out / "logits.safetensors"
     save_file({"logits": logits.detach().cpu().contiguous()}, logits_path)
     consumed = progress[-1]["consumed"]
@@ -196,7 +197,12 @@ def main():
     parser.add_argument("--cuda-smoke", action="store_true")
     parser.add_argument("--cuda-shapes", action="store_true")
     parser.add_argument("--fp32-rope", action="store_true")
+    parser.add_argument("--exact-prefix", action="store_true",
+                        help="Score the captured 101135-input prefix in 4096-token chunks")
     args = parser.parse_args()
+    total, chunk = (EXACT_TOTAL, EXACT_CHUNK) if args.exact_prefix else (TOTAL, CHUNK)
+    if args.exact_prefix and (args.cuda_smoke or args.cuda_shapes):
+        parser.error("--exact-prefix requires scoring")
     if args.fp32_rope and (args.cuda_smoke or args.cuda_shapes):
         parser.error("--fp32-rope requires scoring")
     torch.set_num_threads(2)
@@ -212,6 +218,8 @@ def main():
     if available_bytes() < 32 * GIB:
         raise MemoryError("Need at least 32 GiB MemAvailable before scoring")
     manifest = json.loads((args.inputs / "manifest.json").read_text())
+    if manifest.get("score_profile") != ("exact-prefix" if args.exact_prefix else None):
+        raise ValueError("Manifest score profile differs from requested replay")
     for name, digest in manifest["files"].items():
         if sha256(args.inputs / name) != digest:
             raise ValueError(f"Input hash mismatch: {name}")
@@ -232,11 +240,11 @@ def main():
     model = model.to("cuda")
     with safe_open(args.inputs / "combined-embeddings.safetensors", framework="pt", device="cpu") as source:
         embeddings = source.get_tensor("embeddings")
-    if embeddings.shape != (TOTAL, 1024) or embeddings.dtype != torch.bfloat16:
+    if embeddings.shape != (total, 1024) or embeddings.dtype != torch.bfloat16:
         raise ValueError("Unexpected saved embeddings")
     digest = hashlib.sha256()
-    for start in range(0, TOTAL, CHUNK):
-        digest.update(embeddings[start:start + CHUNK].float().numpy().tobytes())
+    for start in range(0, total, chunk):
+        digest.update(embeddings[start:start + chunk].float().numpy().tobytes())
     if digest.hexdigest() != manifest["embedding_float32_sha256"]:
         raise ValueError("Embedding content digest differs")
     metadata = {"probe_sha256": sha256(__file__), "dependencies": dependencies,
@@ -253,10 +261,10 @@ def main():
                 "fp32_rope": args.fp32_rope, "rope_original_dtype": original_rope_dtype,
                 "rope_original_sha256": original_rope_sha256,
                 "rope_attention_scaling": model.rotary_emb.attention_scaling,
-                "model_revision": manifest["model_revision"], "chunk": CHUNK,
+                "model_revision": manifest["model_revision"], "chunk": chunk, "exact_prefix": args.exact_prefix,
                 "attn_implementation": config._attn_implementation, "math_sdpa_enabled": False,
                 "loader": "Pinned official ModelRunner BF16 cast, decoder only"}
-    print(json.dumps(record_score(model, embeddings, args.out, metadata)))
+    print(json.dumps(record_score(model, embeddings, args.out, metadata, chunk_size=chunk)))
 
 
 if __name__ == "__main__":

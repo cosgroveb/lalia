@@ -1,0 +1,46 @@
+{
+  "measurement_artifact": "official-cuda-e2e-20261027",
+  "measurement_source_inventory_sha256": "7f0b20bf0cc173414cfe121c3cae91551388e33f69f85b020d3eec326a4d4a76",
+  "measurement_local_inventory_sha256": "f7627798949b36fcc10829bdf0687b6c4013050d703b6c0c32e6cd2edb7773e0",
+  "measurement_worker_sha256": "1b2c3c967cbecb3ed061705f65d4c48e3a532f6c29c1b6ab4e63fbb197f8ce84",
+  "reference_manifest_sha256": "26f0d2e503b8b769a50a480fc8fe479a35d7d98858eb67abcb9f81ea4c7abc52",
+  "model_url": "https://huggingface.co/OpenMOSS-Team/MOSS-Transcribe-Diarize/tree/704aa4a9c304e8520be88901e0d1960158ef5b15",
+  "helper_url": "https://raw.githubusercontent.com/OpenMOSS/MOSS-Transcribe-Diarize/79c675f0670cc2f824bcbcdd98263704f40f1f7e/moss_transcribe_diarize/inference_utils.py",
+  "integration": "Model arithmetic, inputs and native greedy generation are unchanged. The worker observes already-selected CPU streamer IDs, preserves incomplete checkpoints, and verifies them against the returned sequence. GB10 admission uses 72 GiB host MemAvailable. Preparation and scoring reuse repository helpers.",
+  "current_worker_sha256": "df63b3ff6e46c56739a147ae35061612fbdf919d882082475511238ec358d0d9",
+  "resource_admission_reference": "https://nvidia.custhelp.com/app/answers/detail/a_id/5728",
+  "measurement_execution_report_sha256": "91263dd625a39454817eb27378218a4bc4608c69a3843088922b4e0623e4f08c",
+  "measurement_execution_evidence_inventory_sha256": "6ee2f96edb02ad8a3d315ffa90a0cf0eafd16e61fe8f4cebce1bb4dbae2372f4",
+  "cache_profile": {
+    "environment": {
+      "TRITON_CACHE_DIR": "/tmp/triton",
+      "PYTORCH_KERNEL_CACHE_PATH": "/tmp/torch-kernels"
+    },
+    "tmpfs": "/tmp:rw,nosuid,exec,size=2g",
+    "initialization": "Create the explicit Torch cache directory before starting Python. Triton creates its own cache directory.",
+    "triton_installed_sources": {
+      "triton/knobs.py": "85948451cc241f900e0ab19fe591a9127877f8de7fcc39b1c0bae9c0dc21e60d",
+      "triton/runtime/cache.py": "58b25352786ff1d04468ce113f1986063da0b78640428046a28c8ede4c9126ac"
+    },
+    "torch_source": "https://github.com/pytorch/pytorch/blob/5c4886908584029761b579af026dcfb627c84070/aten/src/ATen/native/cuda/jit_utils.cpp#L1467-L1507",
+    "tmpfs_reference": "https://docs.docker.com/engine/storage/tmpfs/#options-for---tmpfs",
+    "preflight": "Before a service pause, require a successful 4 GiB, 60-second no-model kernel preflight and cleanup using the same cache environment and tmpfs options as the model container."
+  },
+  "current_kernel_preflight_sha256": "e02125f11687f8d042ee7c4deaa588fd17401d4bad2e5a8c65bca0c1755c88a5",
+  "extended_reference": {
+    "predecessor": "official-cuda-e2e-20261027-r3",
+    "predecessor_execution_report_sha256": "407886debfcea385901c13a1fb5dee67a969d2567656274eefd2591be5a5bc62",
+    "predecessor_evidence_inventory_sha256": "b220d75f7658a4dfef7cca30e665f46fe799d5b29c344190906285e931f2407a",
+    "predecessor_last_checkpoint": {
+      "generated_tokens": 17024,
+      "seconds": 2391.739654231351,
+      "native_finish_observed": false
+    },
+    "worker_seconds": 10800,
+    "attach_seconds": 10820,
+    "watchdog_seconds": 11700,
+    "watchdog_join_seconds": 600,
+    "partial_tokens": "Atomically checkpoint every 128 selected CPU tokens and at EOS/end. Checkpoints remain marked incomplete. Require exact equality with returned generation IDs before final result evidence.",
+    "timing_limit": "Three hours permits an average 4.60 tokens/s after 120 seconds of setup, below the final observed 6.92 tokens/s interval. Decode slowdown and observer I/O may still exhaust the bound."
+  }
+}

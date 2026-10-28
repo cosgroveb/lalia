@@ -1,0 +1,25 @@
+{
+  "model_revision": "704aa4a9c304e8520be88901e0d1960158ef5b15",
+  "helper_revision": "79c675f0670cc2f824bcbcdd98263704f40f1f7e",
+  "helper_sha256": "1d97700b83ed95438be2e3a59529b3726d7bf7f7cdd488ad2097180bad15b86b",
+  "audio_seconds": 5400,
+  "files": {
+    "model/added_tokens.json": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680",
+    "model/chat_template.jinja": "8641466a16b184ebaf7c4903391e607cfd532ab937e81a64120628ab79d827f4",
+    "model/config.json": "2b2b7a6e61334152bdd7ecf8a4da3073b4940a097e193d1d2b22093e77535234",
+    "model/configuration_moss_transcribe_diarize.py": "b4d12b0f4609af69b61c2fe3aa5fbaf476af22278369e4540745bc47d1d37892",
+    "model/generation_config.json": "e53a4b3ce4f944230cf1ca8fed0c42f4ff0d8c1443eaf98b5315d987334dd9e4",
+    "model/model.safetensors.index.json": "0345ac5d8f360abe4e9adadb5fecd38e7730052b75f64bb58182818b1544cc36",
+    "model/modeling_moss_transcribe_diarize.py": "a01da90fe1f7cb88942b8c56f443e7b4ecd307ed4b4c356ac08d7503dd7422c1",
+    "model/preprocessor_config.json": "ba2e601484abc80f4cded977f9a4fd4a53175b7d35c2f2511f0cfc3a32ad2499",
+    "model/processing_moss_transcribe_diarize.py": "6f228d22d9379e2f6a6830b18ce7336b22da8267547e96e65545d871d7f48766",
+    "model/processor_config.json": "a978c2dd54a65b576c3dae4b654fe9bcbac1184c6db2df0afb2c90fcdc872ae7",
+    "model/special_tokens_map.json": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd",
+    "model/tokenizer.json": "bcf03774334462d6e34b5005cb11120a62275f146ee2953e68731ecdbce84fbb",
+    "model/tokenizer_config.json": "61d04c96104177240688396655ae3f7cf38ce2ea036db867a1d2b6883e27c3d5",
+    "model/vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+    "prompt.txt": "5696a90762c9a738598bdf62530952cb9058f0bd2da8dccc23d988b68990e22a",
+    "public90.wav": "85a093bcdcd2d7da573ece51c4ef5ee62c26ac217171dfe0e501eef994684e68",
+    "model/model-00000-of-00001.safetensors": "9a0ceb4ab7330357db3ff583dba8d83625d5b733b00e1d55d6970e11b07026c4"
+  }
+}

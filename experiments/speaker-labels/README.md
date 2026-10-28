@@ -555,3 +555,235 @@ protocol, source archive and cleanup records are under
 Production app, runtime and configuration remain unchanged. This repeated
 fixture adds capacity evidence, not independent long-meeting accuracy evidence.
 The frequency change alone is not a qualified truncation fix.
+
+### Exact-token reproduction
+
+Capture generator IDs and the score vector paired with native EOS before
+replaying a failed prefix. Re-encoding the candidate's returned text yields
+29,451 tokens, versus 29,448 generated, so text cannot reconstruct that prefix.
+The observer also saves prompt embeddings and generated-token embeddings,
+excluding terminal EOS. Trace serialization adds work to the HTTP request.
+
+These diagnostics require the frozen local API-qualification state above.
+Prepare a fresh trace directory with the oMLX Python:
+
+```sh
+python prepare_trace.py --state "$HOME/.local/state/lalia-speaker-qualification/exact-traces/repeat"
+```
+
+Run a selected command from its `protocol.json` explicitly, one at a time.
+The commands carry `LALIA_EXACT_TRACE_STATE` into the isolated launcher.
+Each phase checks its frozen dependencies and records whether text, output
+count and native EOS match the historical response.
+
+`exact_prefix.py --prepare --state <fresh-replay> --trace <completed-trace>`
+requires a complete candidate reproduction. `--run` replays its 101,135
+embeddings in 4,096-token chunks with a final singleton, then compares the
+normalized scores with captured EOS scores. This differs from serial API
+generation. A changed selection blocks `--export-cuda <fresh-bundle>`.
+Exported bundles require `probe/supervise.py score --root <bundle> --exact-prefix`.
+The shared CUDA scorer retains the earlier 88,814-input profile as its default.
+
+October 27 repeats reproduced both historical failures. A fresh unchanged
+control matched its earlier text, segments, language and usage, stopping after
+17,127 output tokens at 36m49s. Two fresh candidate processes each matched the
+earlier 29,448-token response ending at 62m52s. Their exact token IDs, prompt
+embeddings, combined embeddings and EOS-paired score vectors were byte-equal.
+This establishes repeatability on this fixture, not general determinism or
+reliable long-recording transcription.
+
+The original repeat took 406.61s at 23.78 GiB sampled physical footprint.
+Instrumented candidate requests took 859.21s and 854.03s at 26.19 and 26.14
+GiB. Neither grew swap. Trace timings include capture and serialization.
+All 1,508 trace pins and cleanup checks passed.
+
+At the candidate's later stop, the same 101,135 inputs produced these native
+BF16 scores after identical MLX normalization:
+
+| Execution | EOS log-probability | Best continuation (3821) | EOS margin | Selected token |
+|---|---:|---:|---:|---:|
+| Captured serial MLX | -0.625 | -0.750 | +0.125 | 151645 |
+| Batched MLX | -0.625 | -0.875 | +0.250 | 151645 |
+| Batched CUDA logits | -0.750 | -0.750 | 0 | 3821 |
+
+MLX replay took 42.70s at 23.85 GiB sampled physical footprint. CUDA scoring
+took 64.32s with 14.08 GiB peak CUDA allocation, a different memory measure.
+Both used 4,096-token chunks and a final singleton. The CUDA tie survives
+normalization. These near-tie differences do not identify a defective kernel.
+Strict tiny CPU/CUDA decoder parity remains failed. The full official CUDA
+comparison below subsequently completed this fixture.
+
+Exact traces and replay evidence live under
+`~/.local/state/lalia-speaker-qualification/exact-trace-20261027` and
+`exact-prefix-20261027`. Spark's owned container and processes exited, and its
+original coding service returned healthy with the same image. Production
+Lalia and local oMLX remain unchanged.
+
+### Official full CUDA comparison
+
+Run the official audio frontend and generation helper to distinguish a
+conditional decoder score from completed transcription. `cuda/official/prepare.py`
+freezes the pinned public 90-minute WAV, model metadata, official helper,
+scoring references and runner sources into a new directory outside the repo:
+
+```sh
+python cuda/official/prepare.py /path/to/new-state \
+  --inputs /path/to/pinned-inputs --audio /path/to/public90.wav \
+  --helper /path/to/inference_utils.py --references /path/to/public-manifest.json
+```
+
+`inputs-manifest.json` and `provenance.json` identify the required asset hashes
+and revisions. Run the frozen `stage.sh` with a fresh Spark directory and the
+existing remote weight-shard path. Reference transcripts stay local. Build
+the isolated image with `build-image.sh`, then run `preflight.sh` and
+`python3 -B probe/official_supervise.py kernel --root "$PWD"` there. These
+preflights load the WAV and exercise the CUDA kernels without pausing services
+or loading the model.
+
+The full `python3 -B probe/official_supervise.py run --root "$PWD"` requires
+matching source/image receipts and successful preflight cleanup. It pauses
+only the main coding service and restores its original image and health
+afterward. Limits are 64 GiB without swap and 10,800 seconds for the model.
+GB10 admission uses host `MemAvailable`, with a 72 GiB admission threshold
+and an 8 GiB running floor. The read-only container writes Triton/Torch
+compiler caches into its executable 2 GiB temporary filesystem.
+
+Retrieve the results and run the frozen `score_result.py` locally against
+`results/e2e/model`. Native generated IDs establish EOS versus token-cap
+termination. Missing output, failed lifecycle cleanup or changed pins are
+failures even if a process exits zero. Never retry a failed run automatically.
+
+The observer forwards the existing streamer's tensors unchanged and saves
+selected CPU IDs every 128 tokens. Checkpoints remain incomplete lower bounds.
+Only equality with the returned generation sequence establishes final ID
+evidence. Checkpoint copying and writes add unmeasured CPU/I/O overhead, so
+timing is not an uninstrumented performance benchmark.
+
+The October 28 run hit its original 2,400-second deadline. Its last checkpoint
+recorded 17,024 tokens at 2,391.74s and an 11.53 GiB CUDA allocation peak.
+Both are lower bounds. That run saved no final IDs or transcript and cannot
+establish premature EOS or accuracy. Cleanup restored the original coding
+service and reaped owned processes. The extended three-hour bound allows
+slower decoding than the observed final interval of 6.92 tokens/s. It does
+not guarantee completion.
+
+The extended run reached native EOS after 43,187 generated IDs, including
+the terminal EOS, below the 49,152 cap. The observer's IDs exactly matched
+the final returned sequence. It produced 1,345 valid passages, four speakers
+and no unmatched raw text. Final speech ended at 89m58.31s, versus the last
+reference word at 89m59.685s. Public scoring gave 14.70% cpWER, 15.38% DER
+with a 250ms boundary tolerance, and 91.54% reference-speech coverage.
+
+The worker took 6,882.39s (114m42s), including setup and observer overhead,
+with 14.38 GiB peak CUDA allocation. This is not total physical footprint
+and is not directly comparable with the Mac footprint measurements.
+The host supervisor then failed its result read with `PermissionError`:
+the container had created the model directory as root with mode 0700.
+Read-only recovery independently verified the final IDs, response and scores.
+The failed supervisor check remains recorded. Cleanup restored the original
+coding-service image and HTTP 200, left sidecars unchanged and reaped every
+owned process. Both source inventories and all 289 protected hashes matched.
+
+The launcher now runs the container as the host UID/GID. A separate no-model
+check reproduced the old permission failure, then verified host-readable
+outputs with directory mode 0700 and file mode 0600. The existing tiny CUDA
+kernel check also passed under that identity. All three check containers
+exited, and production image, PID and health stayed unchanged. The full
+transcription was not rerun for this ownership-only correction.
+
+The same public 90-minute fixture now has these measured endpoints:
+
+| Inference path | Last speech | Text tokens, excluding EOS |
+|---|---:|---:|
+| Original MLX | 36m49s | 17,127 |
+| MLX with BF16-derived frequencies | 62m52s | 29,448 |
+| Official CUDA | 89m58s | 43,186 |
+
+The published model can complete this fixture through the official path.
+The residual Mac cutoff remains to be isolated among the differing inference
+paths. This result does not identify a defective kernel or qualify the
+frequency patch as a complete fix. The MLX rows used the earlier frozen
+runtime replacement. The exact-fork 60-minute matrix below is a separate test.
+Full reference evidence is under
+`/tmp/unified-coordinator-lalia-speaker-labels/official-cuda-e2e-20261028-r4`.
+
+### Qualify a 60-minute limit
+
+Use `limit60.py` to test the exact fork package through isolated oMLX before
+changing Lalia's recording limit. Preparation freezes fork commit `67408c4`,
+the existing HTTP prompt/usage patches, scoring code and public inputs. The
+constructor audit requires the MOSS-local RoPE implementation and its measured
+BF16-derived frequencies. It does not apply the earlier post-load replacement.
+
+```sh
+python limit60.py prepare --state /path/to/new-trial \
+  --fork /path/to/mlx-audio --audio /path/to/IN1014.Mix-Headset.wav \
+  --rttm /path/to/IN1014.rttm
+```
+
+Use the existing scoring environment and the [official IN1014 WAV](https://groups.inf.ed.ac.uk/ami/AMICorpusMirror/amicorpus/IN1014/audio/IN1014.Mix-Headset.wav)
+with its [pinned RTTM](https://raw.githubusercontent.com/pyannote/AMI-diarization-setup/67c2d539286e89f68952d5dcf83912bd9f01dfae/only_words/rttms/train/IN1014.rttm).
+The prepared manifest retains AMI attribution and the training-partition
+caveat. MOSS training overlap is unknown. Existing local ES2004a assets and
+the accepted historical short result are required too.
+
+Run `source/limit60.py run --state /path/to/new-trial --phase <phase>` from
+the frozen trial, in order: `a-control`, `a-hour`, `b-control`, `b-hour`.
+Each phase uses a cold process and stops the matrix on failure. A tests the
+existing repeated hour after a short regression control. B tests IN1014's
+continuous final hour after its matched short control. Both retain the same
+final five minutes as their controls.
+
+Acceptance combines native EOS and token audits with full-reference scoring,
+matched-tail accuracy/coverage and speaker consistency across the recording.
+Read `evaluation.json` and `cleanup.json` before advancing. Control requests
+have a 600-second bound, hour requests 2,400 seconds, with the existing 64 GiB
+footprint and 25% battery guards. Record power before each request.
+
+Passing would support an alpha claim for these two headset-mix inputs. It
+would not establish universal 60-minute completion or ambient-audio accuracy.
+The fork also contains upstream changes relative to the earlier runtime, so
+these tests cannot isolate rotary-frequency rounding as the sole cause.
+
+October 28 exact-fork results:
+
+| Input | Accepted | Text tokens | HTTP seconds | Peak physical GiB | cpWER | DER, 250ms |
+|---|---|---:|---:|---:|---:|---:|
+| ES2004a 17m29 control | Yes | 8,693 | 65.18 | 8.25 | 12.17% | 13.78% |
+| ES2004a repeated 60m | Yes | 31,806 | 668.63 | 20.80 | 12.40% | 12.88% |
+| IN1014 17m29 control | Yes | 10,299 | 78.57 | 8.62 | 12.62% | 11.61% |
+| IN1014 continuous 60m | No | 30,965 | 722.59 | 20.64 | 12.88% | 9.87% |
+
+All four requests reached native EOS without swap growth. Both hour requests
+reached the annotated ending. The repeated case kept its speaker assignments
+across all blocks, and the independent case kept the four reference-speaker
+assignments across all quarters. The short ES2004a response exactly matched
+the earlier runtime-replacement response in text, segments, language and usage.
+
+The independent hour failed with `Invalid segment timestamps`: its final
+S05 passage contains 32 normalized words at 3593.81–3600.01s. The literal
+`[3600.01]` exceeds input duration by 10ms. The extra label also fails the
+four-speaker gate. No threshold or output was changed to accept it. That
+passage follows the last annotated word at 3593.570625s. The source tail has
+nonzero audio, so missing annotations do not establish silence or hallucination.
+Its identical short-control tail generated one later word, not that 32-word
+passage. Different input context and encoder alignment prevent isolating a
+decoder cause.
+
+Matched-tail checks stayed within their frozen deltas. The independent hour's
+tail cpWER was 15.45%, DER 13.27% and reference speech coverage 95.27%, versus
+12.76%, 12.70% and 94.26% in its control. This distinguishes the final output
+contract failure from the earlier premature-cutoff failure. The formal
+60-minute qualification remains failed.
+
+Both hour outputs exceed the earlier 90-minute candidate's 29,448 text tokens,
+which excludes a fixed 29k output ceiling on these runs. Their shorter input
+contexts and the fork's other upstream changes remain confounders. These
+observations do not establish a causal sequence-length threshold.
+
+All 3,163 pins matched after the matrix. Nineteen recorded task PIDs exited,
+port 18001 closed and production returned HTTP 200. Memory values are sampled
+physical peaks. Nice 10 was applied during the repeated hour and inherited by
+both IN1014 phases to preserve CPU responsiveness. Evidence and the unchanged
+rejection are under
+`~/.local/state/lalia-speaker-qualification/limit60-20261028-r2`.

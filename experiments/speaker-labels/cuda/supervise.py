@@ -11,6 +11,7 @@ import uuid
 
 SERVICE = "vllm-vllm.service"
 IMAGE = "lalia-moss-cuda-probe:20261027-r4"
+EXACT_PREFIX_IMAGE = "sha256:ae2d9c549e3fdcaffed02030a86ff1f0ac7a781ae4b79e1c29a867030b4fab48"
 LABEL = "lalia.moss.probe.owner"
 SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 
@@ -31,9 +32,12 @@ def command(argv, timeout):
 
 
 class Supervisor:
-    def __init__(self, root, mode, call=command, popen=subprocess.Popen, sleep=time.sleep, *, fp32_rope=False):
+    def __init__(self, root, mode, call=command, popen=subprocess.Popen, sleep=time.sleep, *, fp32_rope=False, exact_prefix=False):
         if fp32_rope and mode != "score":
             raise ValueError("--fp32-rope requires score mode")
+        if exact_prefix and mode != "score":
+            raise ValueError("--exact-prefix requires score mode")
+        self.exact_prefix = exact_prefix
         self.fp32_rope = fp32_rope
         self.root, self.mode = root.resolve(), mode
         self.work = self.root / "results" / mode
@@ -97,10 +101,12 @@ class Supervisor:
                 "--volume", f"{self.root / 'probe'}:/probe:ro",
                 "--volume", f"{self.work}:/results",
                 "--volume", f"{self.root / 'inputs'}:/inputs:ro",
-                "--entrypoint", "timeout", IMAGE, "--signal=TERM", "--kill-after=5s",
+                "--entrypoint", "timeout", EXACT_PREFIX_IMAGE if self.exact_prefix else IMAGE, "--signal=TERM", "--kill-after=5s",
                 f"{seconds}s", "python3", script]
         args += {"smoke": ["--cuda-smoke"], "shapes": ["--cuda-shapes"],
                  "decoder": [], "score": ["--inputs", "/inputs", "--out", "/results/model"]}[self.mode]
+        if self.exact_prefix:
+            args.append("--exact-prefix")
         if self.fp32_rope:
             args.append("--fp32-rope")
         self.call(args, 30)
@@ -206,7 +212,7 @@ class Supervisor:
             finally:
                 for sig, handler in previous.items():
                     signal.signal(sig, handler)
-        report = {"mode": self.mode, "fp32_rope": self.fp32_rope, "name": self.name, "cid": self.cid,
+        report = {"mode": self.mode, "fp32_rope": self.fp32_rope, "exact_prefix": self.exact_prefix, "name": self.name, "cid": self.cid,
                   "owner_label": self.owner, "original_error": original,
                   "cleanup_errors": errors, "events": self.events}
         if self.created_work:
@@ -220,10 +226,11 @@ def main():
     parser.add_argument("mode", choices=("smoke", "shapes", "decoder", "score"))
     parser.add_argument("--root", type=Path, default=Path("/tmp/lalia-moss-cuda-20261027-r4"))
     parser.add_argument("--fp32-rope", action="store_true")
+    parser.add_argument("--exact-prefix", action="store_true")
     args = parser.parse_args()
     for sig in SIGNALS:
         signal.signal(sig, interrupted)
-    raise SystemExit(Supervisor(args.root, args.mode, fp32_rope=args.fp32_rope).run())
+    raise SystemExit(Supervisor(args.root, args.mode, fp32_rope=args.fp32_rope, exact_prefix=args.exact_prefix).run())
 
 
 if __name__ == "__main__":

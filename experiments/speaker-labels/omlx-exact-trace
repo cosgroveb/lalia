@@ -1,0 +1,4 @@
+#!/bin/sh
+export PYTHONDONTWRITEBYTECODE=1
+export PYTHONPATH="$HOME/.local/state/lalia-speaker-qualification/official-api-path/runtime"
+exec /opt/homebrew/opt/omlx/libexec/bin/python -B "$(dirname "$0")/trace_runtime.py" "$@"

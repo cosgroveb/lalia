@@ -89,11 +89,11 @@ class ImmediateHealthSupervisor(supervise.Supervisor):
 
 
 class SupervisorTests(unittest.TestCase):
-    def run_case(self, fake, mode="score", cid_collision=False, real_health=False, fp32_rope=False):
+    def run_case(self, fake, mode="score", cid_collision=False, real_health=False, fp32_rope=False, exact_prefix=False):
         with tempfile.TemporaryDirectory() as directory:
             cls = supervise.Supervisor if real_health else ImmediateHealthSupervisor
             runner = cls(Path(directory), mode, fake.call, fake.popen, sleep=lambda seconds: None,
-                         fp32_rope=fp32_rope)
+                         fp32_rope=fp32_rope, exact_prefix=exact_prefix)
             if cid_collision:
                 runner.work.mkdir(parents=True)
                 runner.cidfile.write_text("foreign")
@@ -112,6 +112,21 @@ class SupervisorTests(unittest.TestCase):
         code, report, calls = self.run_case(FakeDocker())
         self.assertEqual(code, 0)
         self.assert_cleanup_order(report)
+
+    def test_exact_prefix_selects_pinned_image_and_preserves_bounds(self):
+        for enabled in (False, True):
+            code, report, calls = self.run_case(FakeDocker(), exact_prefix=enabled)
+            self.assertEqual(code, 0)
+            self.assertEqual(report["exact_prefix"], enabled)
+            create = next(call for call in calls if call[:2] == ["docker", "create"])
+            image = supervise.EXACT_PREFIX_IMAGE if enabled else supervise.IMAGE
+            self.assertIn(image, create)
+            self.assertEqual("--exact-prefix" in create, enabled)
+            self.assertEqual(create[create.index("--memory") + 1], "24g")
+            self.assertIn("300s", create)
+            self.assert_cleanup_order(report)
+        with self.assertRaisesRegex(ValueError, "requires score mode"):
+            supervise.Supervisor(Path("/unused"), "smoke", exact_prefix=True)
 
     def test_fp32_rope_is_explicit_and_preserves_score_bounds(self):
         for enabled in (False, True):
