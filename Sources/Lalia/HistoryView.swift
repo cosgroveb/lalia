@@ -21,7 +21,7 @@ struct HistoryView: View {
                         Text(session.createdAt.formatted()).font(.title2)
                         if let error = session.captureError { Text(error).foregroundStyle(.red) }
                         if let error = session.transcriptionError { Text(error).foregroundStyle(.red) }
-                        if session.endedAtLimit == true { Text("Recording stopped at the 90-minute limit.").foregroundStyle(.secondary) }
+                        if session.endedAtLimit == true { Text("Recording stopped at the 60-minute limit.").foregroundStyle(.secondary) }
                         if let status = coordinator.processing[session.id] {
                             Text(status).foregroundStyle(.secondary)
                             Button("Cancel Processing") { coordinator.cancelProcessing(session.id) }
@@ -39,13 +39,15 @@ struct HistoryView: View {
                             Button("Reveal Recordings") { NSWorkspace.shared.open(coordinator.store.directory(session.id)) }
                         }
                         if session.duration > SessionTranscriptionProfile.maximumDuration {
-                            Text("Speaker labels support recordings up to 90 minutes. Original audio and existing transcripts remain available.").foregroundStyle(.secondary)
+                            Text("Speaker labels support recordings up to 60 minutes. Original audio and existing transcripts remain available.").foregroundStyle(.secondary)
                         }
                         if session.analysis?.previous != nil || session.analysis?.previousIsLegacy == true {
                             Button("Restore Previous Transcript") { playback.stop(); coordinator.restoreTranscript(session.id) }.disabled(!coordinator.canProcess(session.id))
                         }
                         Text(session.transcriptionComplete ? "Transcript" : "Transcript (incomplete)").font(.headline)
                         if let transcript = session.analysis?.active {
+                            Text("Transcripts may omit speech or include incorrect text and speaker labels. Saved audio is retained.")
+                                .font(.caption).foregroundStyle(.secondary)
                             SpeakerControls(coordinator: coordinator, session: session.id, transcript: transcript)
                                 .id(transcript.id)
                             if playback.playing { Button("Stop Playback") { playback.stop() } }

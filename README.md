@@ -3,20 +3,13 @@
 Native macOS menu-bar dictation and session recording. Hold Command+Shift+D
 and release to paste a local oMLX/Cohere transcript. Press Command+Shift+R to
 toggle recording of microphone and Mac audio, then add speaker labels through
-local MOSS after Stop. Recordings stop after 90 minutes.
+local MOSS after Stop. Recordings stop after 60 minutes.
 
-Speaker-label support on this branch is experimental and has not been deployed.
-Two 60-minute tests with MLX's English default prompt ended after 16,384
-generated tokens, with the last parsed speech at 33m29s. This matches
-[MOSS's open early-stop defect](https://github.com/OpenMOSS/MOSS-Transcribe-Diarize/issues/26).
-One diagnostic with the exact official instruction completed the same hour
-with consistent speaker labels. The actual API path then passed a 17-minute
-baseline but failed at 90 minutes: native EOS after 17,127 tokens, with the
-last parsed speech at 36m49s. Deployment is on hold. Neither the successful
-hour-long diagnostic nor response validation establishes reliable long audio.
-The 90-minute limit bounds capture, not verified transcription capability.
-Keep the working installation for regular meetings until long recordings pass
-qualification. Real-device and coding-model contention checks remain deferred.
+Speaker labels remain experimental. Both tested hour-long recordings completed,
+but MOSS can omit speech or add incorrect text and speaker labels. Review the
+transcript against the saved audio. Failed analysis retains audio and the
+previous transcript for retry. The 60-minute capture limit does not guarantee
+transcription accuracy.
 
 Requires Apple silicon and macOS 26 or newer. Dictation needs Microphone and
 Accessibility permission. Sessions need Microphone and Screen & System Audio
@@ -24,17 +17,16 @@ Recording permission. Accessibility is only for pasting.
 
 ## Install and configure
 
-Build this experimental revision for development checks:
+Install the signed, notarized app through Homebrew:
 
 ```sh
-Support/build-app.sh
-open dist/Lalia.app
+brew install --cask cosgroveb/tap/lalia
 ```
 
 Run oMLX locally with `cohere-transcribe-03-2026` for dictation and
 `MOSS-Transcribe-Diarize` for recordings. Cohere requires Hugging Face access.
 MOSS is public. Session analysis requires the pinned oMLX 0.7.2 / mlx-audio
-0.5.7 runtime with normal JSON token usage, explicit prompt forwarding and a
+0.6.2 fork at `67408c4910edd83935f5618780e51c403ded2676`, with normal JSON token usage, explicit prompt forwarding and a
 250 MB audio upload limit.
 Brian's `omlx-install-transcription` installs this compatibility patch and the
 pinned MOSS model. The installer refuses unknown runtime sources. Lalia rejects
@@ -69,7 +61,7 @@ Press Command+Shift+R once to start recording microphone and Mac audio, then
 again to stop, save, and transcribe. The menu and history window offer the same
 `Start Recording` / `Stop Recording` button. Recording continues when you
 release the shortcut. Lalia shows elapsed and remaining time, warns with five
-minutes remaining, then saves and transcribes at 90 minutes. It does not start
+minutes remaining, then saves and transcribes at 60 minutes. It does not start
 another recording. Holding the shortcut does not toggle repeatedly. Lalia
 ignores the toggle while starting, saving, or dictating. Use
 headphones to reduce Mac playback leaking into the microphone.
@@ -128,7 +120,8 @@ assignments need review. Recovery cannot guarantee that the final partial file
 survives power loss.
 
 Lalia checks token usage, context limits, timed passages, and raw response
-coverage before replacing a transcript. A rejected response stays with the
+coverage before replacing a transcript. End timestamps may exceed the audio
+by at most 100 ms for rounding. Lalia retains the original timestamp and text. A rejected response stays with the
 saved audio for diagnosis. These checks reject exhausted budgets and malformed
 responses. A well-formed early stop can still omit speech. First writes to
 older manifests retain a private schema-1 backup before upgrading to schema 2.

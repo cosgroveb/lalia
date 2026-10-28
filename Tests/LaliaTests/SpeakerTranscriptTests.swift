@@ -25,14 +25,30 @@ struct SpeakerTranscriptTests {
         #expect(transcript.speaker(for: transcript.turns[0]) == "S02")
         try transcript.validate(duration: 2)
     }
-    @Test func sessionTimeRangesStayWithinSavedAudioWithoutChangingDictationTolerance() throws {
-        for start in [0.99, 1.01] {
-            let response = Transcription(text: "[\(start)][S01]late[1.05]",
-                segments: [.init(start: start, end: 1.05, text: "[S01] late", speakerID: "S01")],
-                usage: .init(type: "tokens", inputTokens: 100, outputTokens: 4, totalTokens: 104))
-            #expect(try response.validated(duration: 1) == response)
-            #expect(throws: Error.self) { try SpeakerTranscript(attempt: speakerAttempt(response), duration: 1) }
+    @Test func endRoundingKeepsOriginalTimestampsAndText() throws {
+        let response = Transcription(text: "[0.99][S01]late[1.05]",
+            segments: [.init(start: 0.99, end: 1.05, text: "[S01] late", speakerID: "S01")],
+            usage: .init(type: "tokens", inputTokens: 100, outputTokens: 4, totalTokens: 104))
+        let attempt = try speakerAttempt(response)
+        let transcript = try SpeakerTranscript(attempt: attempt, duration: 1)
+        #expect(try response.validated(duration: 1) == response)
+        #expect(transcript.rawResponse == attempt.rawResponse)
+        #expect(transcript.turns[0].start == 0.99)
+        #expect(transcript.turns[0].end == 1.05)
+        #expect(transcript.turns[0].text == "late")
+        try transcript.validate(duration: 1)
+        for range in [(1.01, 1.05), (0.99, 1.11)] {
+            var invalid = response
+            invalid.segments?[0].start = range.0
+            invalid.segments?[0].end = range.1
+            #expect(throws: Error.self) { try invalid.validated(duration: 1) }
+            #expect(throws: Error.self) { try SpeakerTranscript(attempt: speakerAttempt(invalid), duration: 1) }
         }
+    }
+    @Test func earlierLongAnalysesRemainReadable() throws {
+        let transcript = try SpeakerTranscript(attempt: speakerAttempt(), duration: 5_400)
+        try transcript.validate(duration: 5_400)
+        #expect(SessionTranscriptionProfile.maximumDuration == 3_600)
     }
     @Test func newSpeakerDefaultNameIsUnusedAfterMerge() throws {
         var transcript = try SpeakerTranscript(attempt: speakerAttempt(), duration: 2)

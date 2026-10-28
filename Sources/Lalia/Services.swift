@@ -68,7 +68,7 @@ struct Transcription: Codable, Equatable, Sendable {
         if let segments {
             for segment in segments {
                 guard segment.start.isFinite, segment.end.isFinite,
-                      segment.start >= 0, segment.end > segment.start,
+                      segment.start >= 0, segment.start < duration, segment.end > segment.start,
                       segment.end <= duration + 0.1 else {
                     throw LaliaError("oMLX returned invalid transcript time ranges.")
                 }

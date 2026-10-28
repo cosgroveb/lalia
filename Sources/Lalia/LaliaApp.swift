@@ -129,6 +129,6 @@ struct RecordingButton: View {
             coordinator.toggleRecording()
         }
         .disabled(coordinator.phase != .recordingSession && !coordinator.available)
-        .help("Record microphone and Mac audio for up to 90 minutes, then add speaker labels.")
+        .help("Record microphone and Mac audio for up to 60 minutes, then add speaker labels.")
     }
 }

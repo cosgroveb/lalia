@@ -151,7 +151,7 @@ final class SessionStore: @unchecked Sendable {
         if let analysis = record.analysis {
             if let input = analysis.input {
                 _ = try file(id, input.filename)
-                guard input.frames > 0, input.frames <= Int64(SessionTranscriptionProfile.maximumDuration * 16_000) else { throw LaliaError("Invalid mixed audio metadata.") }
+                guard input.frames > 0, input.frames <= Int64(SessionTranscriptionProfile.maximumSavedDuration * 16_000) else { throw LaliaError("Invalid mixed audio metadata.") }
             }
             if let attempt = analysis.attempt { try attempt.profile.validate() }
             let duration = analysis.input?.duration ?? record.duration

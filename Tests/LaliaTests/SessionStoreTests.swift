@@ -4,6 +4,17 @@ import Testing
 @testable import Lalia
 
 struct SessionStoreTests {
+    @Test func earlierLongAnalysisSurvivesReducedRecordingLimit() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let record = try savedAudio(store, seconds: 2)
+        let transcript = try SpeakerTranscript(attempt: speakerAttempt(), duration: 5_400)
+        try store.update(record.id) {
+            $0.analysis = SessionAnalysis(input: .init(filename: "session-mix.wav", frames: 5_400 * 16_000, silence: false), active: transcript)
+        }
+        let reopened = try SessionStore(root: store.root).read(record.id)
+        #expect(reopened.analysis?.input?.duration == 5_400)
+        #expect(reopened.transcript == transcript.transcript)
+    }
     @Test func interruptedAnalysisRecoverySurfacesRetryReasonInHistory() throws {
         let fixture = TemporaryStore(); let store = fixture.store
         for state: SessionAnalysis.Attempt.State in [.preparing, .running] {

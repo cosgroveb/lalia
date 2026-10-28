@@ -55,7 +55,7 @@ struct SessionAudioPreparerTests {
         try writer.finish(); try store.update(record.id) { $0.captureState = .complete }
         #expect(try store.read(record.id).duration <= 0.25)
         #expect(try SessionAudioPreparer().prepare(session: record.id, store: store).frames == 4_000)
-        try store.update(record.id) { $0.segments[0].start = 5_400; $0.analysis?.input = nil }
+        try store.update(record.id) { $0.segments[0].start = 3_600; $0.analysis?.input = nil }
         #expect(throws: Error.self) { try SessionAudioPreparer().prepare(session: record.id, store: store) }
         #expect(try store.read(record.id).segments[0].frames == 4_000)
     }

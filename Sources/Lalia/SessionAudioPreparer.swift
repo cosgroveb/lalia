@@ -6,7 +6,7 @@ struct SessionAudioPreparer: Sendable {
         let record = try store.read(id)
         guard record.captureState != .recording else { throw LaliaError("Stop recording before transcription.") }
         guard record.duration <= SessionTranscriptionProfile.maximumDuration else {
-            throw LaliaError("Speaker labels support recordings up to 90 minutes. This recording and its transcript are unchanged.")
+            throw LaliaError("Speaker labels support recordings up to 60 minutes. This recording and its transcript are unchanged.")
         }
         if let input = record.analysis?.input, FileManager.default.fileExists(atPath: try store.file(id, input.filename).path) {
             let file = try AVAudioFile(forReading: store.file(id, input.filename))

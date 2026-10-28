@@ -1,7 +1,9 @@
 import Foundation
 
 struct SessionTranscriptionProfile: Codable, Equatable, Sendable {
-    static let maximumDuration = 5_400.0
+    static let maximumDuration = 3_600.0
+    // Keep analyses saved by the earlier 90-minute build readable.
+    static let maximumSavedDuration = 5_400.0
     // OpenMOSS inference_utils.py DEFAULT_PROMPT at 79c675f0670cc2f824bcbcdd98263704f40f1f7e.
     static let officialPrompt = "请将音频转写为文本，每一段需以起始时间戳和说话人编号（[S01]、[S02]、[S03]…）开头，正文为对应的语音内容，并在段末标注结束时间戳，以清晰标明该段语音范围。"
     var baseURL = "http://127.0.0.1:8000/v1"
@@ -67,7 +69,7 @@ struct SpeakerTranscript: Codable, Identifiable, Sendable {
 
     init(attempt: SessionAnalysis.Attempt, duration: Double) throws {
         try attempt.profile.validate()
-        guard duration.isFinite, duration > 0, duration <= SessionTranscriptionProfile.maximumDuration,
+        guard duration.isFinite, duration > 0, duration <= SessionTranscriptionProfile.maximumSavedDuration,
               let raw = attempt.rawResponse else { throw LaliaError("Session analysis has no valid saved audio or response.") }
         let response = try JSONDecoder().decode(Transcription.self, from: raw).validated(duration: duration)
         guard let usage = response.usage, usage.type == "tokens", usage.inputTokens > 0,
@@ -78,9 +80,6 @@ struct SpeakerTranscript: Codable, Identifiable, Sendable {
             throw LaliaError("MOSS completion could not be verified: missing, inconsistent, exhausted, or out-of-context token usage. Audio and the previous transcript are retained.")
         }
         let segments = response.segments ?? []
-        guard segments.allSatisfy({ $0.end <= duration }) else {
-            throw LaliaError("MOSS returned passages outside the saved audio duration.")
-        }
         try Self.reconcile(response.text, segments: segments)
         id = attempt.id; profile = attempt.profile; rawResponse = raw
         turns = segments.enumerated().sorted {
