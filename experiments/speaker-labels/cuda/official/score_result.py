@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import sys
 
+
 def sha256(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
