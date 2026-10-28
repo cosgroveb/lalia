@@ -619,6 +619,48 @@ Exact traces and replay evidence live under
 original coding service returned healthy with the same image. Production
 Lalia and local oMLX remain unchanged.
 
+### Residual rotary-operator comparison
+
+`residual_rope.py` compares the native BF16-frequency wrapper with existing
+`ReferenceRoPE(..., bf16_frequencies=True)` at the saved 101,135-input prefix.
+It uses the historical runtime, fresh workers/KV caches and the same replay
+schedule. Both historical raw and normalized vector hashes must reproduce
+before the candidate runs. Neither worker generates a token.
+
+Prepare a fresh state, then review its frozen protocol before replacing
+`--prepare` with `--run` in the frozen `source/residual_rope.py` command:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 VECLIB_MAXIMUM_THREADS=2 nice -n 10 \
+  /opt/homebrew/opt/omlx/libexec/bin/python -B experiments/speaker-labels/residual_rope.py \
+  --state /path/to/new-residual-trial --prepare
+```
+
+Limits are 300 seconds per arm, 600 overall and 32 GiB combined task-child
+physical footprint. Useful work stops at 555 seconds to reserve postflight
+time. Cancellation, guard failures or changed pins invalidate the comparison,
+even if a worker exits zero. Cleanup reaps owned groups and verifies production
+health. Completed states cannot be retried.
+
+The October 28 comparison passed its baseline gate but rejected the hypothesis:
+
+| Operator | Raw EOS / continuation 3821 | EOS margin | Wall seconds | Peak physical GiB |
+|---|---|---:|---:|---:|
+| Native BF16-frequency wrapper | 19.5 / 19.25 | +0.25 | 42.35 | 24.18 |
+| BF16 reference | 19.625 / 19.25 | +0.375 | 49.91 | 23.70 |
+
+EOS 151645 remained the unique maximum. Normalized margins agree. Both arms
+consumed all 101,135 inputs with 28 BF16 caches, and the full comparison took
+97.44 seconds. All 1,554 pins matched, production stayed healthy, owned workers
+exited and swap did not grow.
+
+This whole-operator replacement is insufficient at the residual prefix. It
+changes phase reconstruction, CPU-versus-Metal trigonometry and BF16 rounding
+together. The negative result does not rule out every rotary difference or
+identify defective native math. No serial continuation or transcript was
+generated. Full vectors and receipts remain under
+`~/.local/state/lalia-speaker-qualification/residual-operator-20261028`.
+
 ### Official full CUDA comparison
 
 Run the official audio frontend and generation helper to distinguish a
