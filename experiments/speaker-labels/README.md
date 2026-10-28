@@ -661,6 +661,64 @@ identify defective native math. No serial continuation or transcript was
 generated. Full vectors and receipts remain under
 `~/.local/state/lalia-speaker-qualification/residual-operator-20261028`.
 
+### Residual SiLU comparison
+
+Prepare the fixed activation comparison with the same runner:
+
+```sh
+OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 VECLIB_MAXIMUM_THREADS=2 nice -n 10 \
+  /opt/homebrew/opt/omlx/libexec/bin/python -B experiments/speaker-labels/residual_rope.py \
+  --state /path/to/new-silu-trial --prepare --activation full-silu-bf16
+```
+
+After reviewing the frozen protocol, invoke its `source/residual_rope.py` with
+`--state /path/to/new-silu-trial --run`. The activation option applies only to
+preparation. Both arms retain the historical native BF16 rotary wrapper.
+Candidate replaces only the model's 28 `qwen3_asr.TextMLP` instances, retaining
+their projection objects and parameter identities. The compiled helper computes
+full FP32 `g / (1 + exp(-g))`, casts to BF16, then uses the unchanged BF16
+up-product and down-projection. This changes the sigmoid formula and rounding
+together, so it cannot isolate one rounding boundary.
+
+A separate 30-second worker first exercises the exact historical `TextMLP`
+call and compiled candidate on the fixed 1,537-element fixture. It saves actual
+vectors and a recomputed Torch CPU reference. The historical output must
+reproduce 458 mismatches and the candidate zero, with both saved hashes matching.
+Failed checks or changed artifacts stop before model replay. Each process
+initializes Torch threads once. The existing baseline-vector gate, 32 GiB,
+300-second arm and 600-second total bounds still apply, including preflight.
+
+Baseline retains its original instances without hooks. Its internal forward
+dtypes remain unobserved, with source, weight dtypes, fixture dtypes and exact
+full-vector reproduction checked separately. Candidate checks BF16 outputs
+through the replacement MLP. A sampled CPU match does not establish CUDA
+equivalence or transcript recovery.
+
+October 28 result: the exact-path Metal preflight passed in 4.258 seconds,
+including both fixed vector hashes, the 458-versus-zero CPU mismatch counts,
+all BF16 dtypes and retained projection/helper identities. Baseline reproduced
+both complete historical vectors. The candidate retained unique EOS:
+
+| Measurement | Baseline | Full-SiLU candidate |
+|---|---:|---:|
+| Raw EOS / token 3821 | 19.5 / 19.25 | 19.625 / 19.25 |
+| Native-normalized EOS / token 3821 | −0.625 / −0.875 | −0.5 / −0.875 |
+| EOS margin | +0.25 | +0.375 |
+| Wall seconds | 43.520 | 61.055 |
+| Peak physical GiB | 24.181 | 24.181 |
+
+Mean raw-vector distance to archived CUDA barely changed, from 0.03778331 to
+0.03772338, while the EOS margin increased. The candidate has the same leading
+scores as the rotary replacement but a different complete vector. This is
+negative evidence for the full-SiLU replacement at this prefix, without
+isolating one rounding boundary or ruling out every activation difference.
+No tokens were generated.
+
+Total time was 115.025 seconds. All 1,576 pins and 1,397 historical runtime
+sources matched, all owned processes exited, production returned HTTP 200 and
+swap did not grow. Frozen vectors, preflight observations and cleanup receipts
+remain under `~/.local/state/lalia-speaker-qualification/residual-silu-20261028`.
+
 ### Official full CUDA comparison
 
 Run the official audio frontend and generation helper to distinguish a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Two gated residual-prefix replays, changing only the whole rotary operator."""
+"""Two gated residual-prefix replays, changing rotary or SiLU arithmetic."""
 
 import argparse
 import gc
@@ -38,6 +38,10 @@ WORK_SECONDS = 555  # Reserve 45s of the 600s total for bounded cleanup and veri
 HELPERS = ("residual_rope.py", "test_residual_rope.py", "exact_prefix.py", "eos_rope.py",
            "trace_runtime.py", "short_windows.py", "window_matching.py")
 PROTECTED = ("run.py", "score.py", "qualification.py", "cuda/manifest.json")
+ROTARY_PROTOCOL = ROOT / "residual-operator-20261028/protocol.json"
+ROTARY_PROTOCOL_SHA = "8f0a8df6a78d69cd50f2e9e730825724b5313e1e0183efe7d7b1fce4b27a62c5"
+SILU_PROPOSAL = Path("/tmp/unified-coordinator-lalia-speaker-labels/next-silu-proposal-20261028.md")
+SILU_PROVENANCE = SILU_PROPOSAL.with_name("next-silu-source-provenance-20261028.json")
 
 
 def inventory(root):
@@ -59,8 +63,34 @@ def frozen(state):
     return protocol
 
 
-def prepare(state):
+def silu_provenance():
+    """Freeze verified source evidence without importing the model libraries."""
+    from importlib.metadata import distribution
+
+    provenance = json.loads(SILU_PROVENANCE.read_text())
+    source = Path(provenance["source_directory"])
+    installed = Path(provenance["installed_site_packages"])
+    hashes = {str(source / entry["file"]): entry["sha256"] for entry in provenance["upstream"]}
+    hashes.update({str(source / name): provenance["probe"][name] for name in ("check.py", "check.json")})
+    hashes.update({str(installed / name): digest for name, digest in provenance["installed_source_hashes"].items()})
+    hashes[str(ROTARY_PROTOCOL)] = ROTARY_PROTOCOL_SHA
+    verify(hashes)
+    for name, version in provenance["installed_versions_from_metadata"].items():
+        package = distribution(name)
+        if package.version != version or Path(package.locate_file("")).resolve() != installed.resolve():
+            raise ValueError(f"SiLU {name} metadata differs from reviewed runtime")
+        path = installed / f"{name}-{version}.dist-info/METADATA"
+        if path.read_text() != package.read_text("METADATA"):
+            raise ValueError(f"SiLU {name} metadata file differs")
+        hashes[str(path)] = sha256(path)
+    hashes.update({str(path): sha256(path) for path in (SILU_PROPOSAL, SILU_PROVENANCE)})
+    return hashes
+
+
+def prepare(state, activation=None):
     """Hash existing evidence and copy reviewed sources. Never import model libraries."""
+    if activation not in (None, "full-silu-bf16"):
+        raise ValueError("Unknown activation comparison")
     if state.exists():
         raise ValueError("State already exists. No overwrite or automatic retry.")
     verify({str(HISTORICAL / "protocol.json"): HISTORICAL_SHA, str(ARCHIVE): ARCHIVE_SHA,
@@ -91,44 +121,52 @@ def prepare(state):
     if json.loads((BASE / "preflight.json").read_text())["model_revision"][1] != MODEL_REVISION:
         raise ValueError("Model revision differs")
     paths = [HISTORICAL / name for name in ("protocol.json", "protocol.sha256", "result.json", "scores.safetensors", "cuda-normalized-comparison.json")]
-    paths += [ARCHIVE, CUDA, PYTHON.resolve(), *(SOURCE / name for name in HELPERS + PROTECTED)]
+    helpers = HELPERS + (("residual_silu.py", "test_residual_silu.py") if activation else ())
+    paths += [ARCHIVE, CUDA, PYTHON.resolve(), *(SOURCE / name for name in helpers + PROTECTED)]
     hashes.update({str(path): sha256(path) for path in paths})
+    if activation:
+        hashes.update(silu_provenance())
     verify({str(trace / "combined-embeddings.safetensors"): EMBEDDING_SHA})
     state.mkdir(parents=True, mode=0o700)
     source = state / "source"
     source.mkdir()
-    for name in HELPERS:
+    for name in helpers:
         shutil.copy2(SOURCE / name, source / name)
         hashes[str(source / name)] = hashes[str(SOURCE / name)]
-    protocol = {"scope": "Residual-prefix whole-RoPE A/B. No token generation or CUDA execution.",
+    scope = "Residual-prefix SiLU A/B" if activation else "Residual-prefix whole-RoPE A/B"
+    protocol = {"scope": scope + ". No token generation or CUDA execution.", "activation": activation,
                 "model_revision": MODEL_REVISION, "trace": str(trace), "cuda": str(CUDA),
                 "python_resolved": str(PYTHON.resolve()), "runtime_sources": runtime_sources,
                 "relocations": relocations, "hashes": hashes,
                 "schedule": {"prompt": 71687, "generated": 29448, "consumed": TOTAL,
                              "chunk": CHUNK, "final_position": TOTAL - 1},
                 "operators": {"baseline": "NativeBF16RoPE(131072)",
-                              "candidate": "ReferenceRoPE(131072, bf16_frequencies=True)"},
+                              "candidate": "NativeBF16RoPE(131072)" if activation else "ReferenceRoPE(131072, bf16_frequencies=True)"},
                 "limits": {"arm_seconds": 300, "overall_seconds": 600, "term_grace_seconds": 5,
                            "work_seconds": WORK_SECONDS, "cleanup_seconds": 15,
                            "postflight_hash_seconds": 20, "postflight_health_seconds": 5,
                            "sampled_footprint_bytes": LIMIT, "battery_cutoff_percent": 25},
                 "commands": {arm: [str(PYTHON), "-B", str(source / "residual_rope.py"),
                                     "--state", str(state), "--worker", arm]
-                             for arm in ("baseline", "candidate")}}
+                             for arm in (("silu-preflight", "baseline", "candidate") if activation else ("baseline", "candidate"))}}
+    if activation:
+        protocol["limits"]["preflight_seconds"] = 30
     save(state / "protocol.json", protocol)
     (state / "protocol.sha256").write_text(sha256(state / "protocol.json") + "\n")
     return protocol
 
 
-def select_operator(arm):
+def select_operator(arm, activation=None):
+    if activation not in (None, "full-silu-bf16") or arm not in ("baseline", "candidate"):
+        raise ValueError("Unknown operator comparison")
+    if activation:
+        arm = "baseline"
     if arm == "baseline":
         rope = NativeBF16RoPE(131072)
         if rope.frequencies["denominator_sha256"] != DENOMINATOR_SHA:
             raise ValueError("Native denominators differ")
-    elif arm == "candidate":
-        rope = ReferenceRoPE(131072, bf16_frequencies=True)
     else:
-        raise ValueError("Unknown arm")
+        rope = ReferenceRoPE(131072, bf16_frequencies=True)
     if rope.frequencies["stored_sha256"] != BF16_FREQUENCY_SHA256:
         raise ValueError("Stored BF16 inverse frequencies differ")
     return rope
@@ -166,11 +204,36 @@ def differences(left, right):
             "mean_absolute_difference": float(mx.mean(difference).item())}
 
 
+def preflight_evidence(state):
+    gate = json.loads((state / "silu-preflight-gate.json").read_text())
+    directory = state / "silu-preflight"
+    verify({str(directory / "result.json"): gate["result_sha256"],
+            str(directory / "vectors.npz"): gate["vectors_sha256"]})
+    report = json.loads((directory / "result.json").read_text())
+    if report["status"] != "complete" or report["vectors_sha256"] != gate["vectors_sha256"]:
+        raise ValueError("SiLU preflight did not complete")
+    return report
+
+
 def worker(state, arm):
     began = time.monotonic()
     protocol = frozen(state)
     if json.loads((state / "started.json").read_text())["pid"] != os.getppid():
         raise ValueError("Workers require the owning supervisor")
+    if os.getpriority(os.PRIO_PROCESS, 0) < 10:
+        raise ValueError("Require nice 10 or lower scheduling priority")
+    activation = protocol.get("activation")
+    if arm == "silu-preflight":
+        if activation != "full-silu-bf16":
+            raise ValueError("Preflight requires the SiLU comparison")
+        from residual_silu import operator_preflight
+
+        operator_preflight(state / arm, BASE / "runtime")
+        return
+    if activation:
+        from residual_silu import require_preflight, select_activation
+
+        require_preflight(preflight_evidence(state))
     if arm == "candidate":
         baseline = json.loads((state / "baseline/result.json").read_text())
         require_baseline(baseline)
@@ -186,8 +249,6 @@ def worker(state, arm):
 
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
-    if os.getpriority(os.PRIO_PROCESS, 0) < 10:
-        raise ValueError("Require nice 10 or lower scheduling priority")
     model = load_model(MODEL, strict=True)
     module = Path(sys.modules[type(model).__module__].__file__).resolve()
     if not module.is_relative_to(BASE / "runtime"):
@@ -195,11 +256,12 @@ def worker(state, arm):
     config = model.config.text_config
     if (config.head_dim, config.rope_theta, config.max_position_embeddings, len(model.layers)) != (128, 1000000, 131072, 28):
         raise ValueError("Unexpected MOSS architecture")
-    rope = select_operator(arm)
+    activation_report = select_activation(model, arm, BASE / "runtime") if activation else None
+    rope = select_operator(arm, activation)
     for layer in model.layers:
         layer.self_attn.rope = rope
     tables = {}
-    if arm == "candidate":
+    if arm == "candidate" and not activation:
         for name in ("cos", "sin"):
             value = getattr(rope, name)
             tables[name] = {"dtype": str(value.dtype), "shape": list(value.shape),
@@ -250,6 +312,7 @@ def worker(state, arm):
                                        "native_normalized": differences(normalized, baseline["logprobs"])}
         result.update(status="complete", consumed_tokens=TOTAL, cache_offsets=offsets, cache_dtypes=cache_dtypes, chunk_tokens=CHUNK,
                       final_position=TOTAL - 1, frequencies=rope.frequencies, tables=tables,
+                      activation=activation_report,
                       embedding_float32_sha256=digest.hexdigest(), comparisons=comparisons,
                       cuda_raw=summary(cuda), cuda_mlx_normalized=summary(cuda_normalized),
                       scores_sha256=sha256(directory / "scores.safetensors"),
@@ -343,6 +406,7 @@ def deadline(*_):
 
 def run_arm(state, arm, protocol, guard):
     began = time.monotonic()
+    seconds = 30 if arm == "silu-preflight" else 300
     guard.check()
     directory = state / arm
     directory.mkdir()
@@ -353,8 +417,8 @@ def run_arm(state, arm, protocol, guard):
     sample_start = len(guard.samples)
     while child.poll() is None:
         guard.check()
-        if time.monotonic() - began >= 300:
-            raise TimeoutError(f"{arm} exceeded 300s including setup")
+        if time.monotonic() - began >= seconds:
+            raise TimeoutError(f"{arm} exceeded {seconds}s including setup")
         time.sleep(0.5)
     child.wait(timeout=5)
     guard.check()
@@ -362,10 +426,13 @@ def run_arm(state, arm, protocol, guard):
         raise RuntimeError("Worker left descendants. Stop before next arm.")
     guard.finished.add(child.pid)
     elapsed = time.monotonic() - began
-    if child.returncode or elapsed >= 300:
+    if child.returncode or elapsed >= seconds:
         raise RuntimeError(f"{arm} failed: exit {child.returncode}, elapsed {elapsed:.3f}s")
     result = json.loads((directory / "result.json").read_text())
-    verify({str(directory / "scores.safetensors"): result["scores_sha256"]})
+    if result["status"] != "complete":
+        raise ValueError(f"{arm} did not complete")
+    artifact, digest = ("vectors.npz", "vectors_sha256") if arm == "silu-preflight" else ("scores.safetensors", "scores_sha256")
+    verify({str(directory / artifact): result[digest]})
     result.update(wall_seconds=elapsed, worker_pid=child.pid, reaped=True,
                   peak_sampled_footprint_bytes=max((s["footprint_bytes"] for s in guard.samples[sample_start:]), default=0))
     save(directory / "result.json", result)
@@ -393,8 +460,17 @@ def execute(state):
         protocol = frozen(state)
         if os.getpriority(os.PRIO_PROCESS, 0) < 10:
             raise ValueError("Launch through nice -n 10")
+        if protocol.get("activation"):
+            measured = run_arm(state, "silu-preflight", protocol, guard)
+            result["preflight"] = measured
+            frozen(state)
+            save(state / "silu-preflight-gate.json", {
+                "result_sha256": sha256(state / "silu-preflight/result.json"),
+                "vectors_sha256": measured["vectors_sha256"]})
         for arm in ("baseline", "candidate"):
             guard.check()
+            if protocol.get("activation"):
+                preflight_evidence(state)
             measured = run_arm(state, arm, protocol, guard)
             result["arms"][arm] = measured
             frozen(state)
@@ -403,6 +479,8 @@ def execute(state):
             if arm == "baseline":
                 require_baseline(measured)
                 save(state / "baseline-gate.json", {"passed": True, "scores_sha256": measured["scores_sha256"]})
+        if protocol.get("activation"):
+            preflight_evidence(state)
         result["status"] = "complete"
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
@@ -447,12 +525,15 @@ def main():
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--prepare", action="store_true")
     mode.add_argument("--run", action="store_true")
-    mode.add_argument("--worker", choices=("baseline", "candidate"), help=argparse.SUPPRESS)
+    mode.add_argument("--worker", choices=("baseline", "candidate", "silu-preflight"), help=argparse.SUPPRESS)
+    parser.add_argument("--activation", choices=("full-silu-bf16",), help="Prepare the fixed SiLU comparison instead of rotary")
     args = parser.parse_args()
+    if args.activation and not args.prepare:
+        parser.error("--activation is only valid with --prepare; later modes use the frozen protocol")
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)
     if args.prepare:
-        protocol = prepare(args.state.resolve())
+        protocol = prepare(args.state.resolve(), args.activation)
         print(json.dumps({"pins": len(protocol["hashes"]), "inference_run": False}))
     elif args.run:
         execute(args.state.resolve())
