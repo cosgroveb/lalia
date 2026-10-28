@@ -41,6 +41,29 @@ class ProbeTests(unittest.TestCase):
         self.assertEqual(sum(b - a for a, b in parts), 101135)
         self.assertTrue(all(left[1] == right[0] for left, right in zip(parts, parts[1:])))
 
+    def test_boundary_capture_preserves_original_projection_rank_and_bytes(self):
+        cfg = config()
+        model = probe.empty_decoder(cfg).eval()
+        # Fixed stub avoids model weights or attention in this projection test.
+        weight = torch.arange(32 * 16, dtype=torch.bfloat16).reshape(32, 16) / 512
+        model.embed_tokens.weight = torch.nn.Parameter(weight, requires_grad=False)
+        cache = types.SimpleNamespace(get_seq_length=lambda *args: 1)
+        hidden = torch.arange(16, dtype=torch.bfloat16).reshape(1, 1, 16)
+        with patch.object(model, "forward", return_value=types.SimpleNamespace(last_hidden_state=hidden, past_key_values=cache)):
+            baseline, _ = probe.score(model, hidden[0])
+            captured, _, final = probe.score(model, hidden[0], capture_hidden=True)
+        self.assertTrue(torch.equal(baseline, captured))
+        self.assertEqual(tuple(final.shape), (1, 16))
+        self.assertEqual(tuple(final.stride()), (16, 1))
+        self.assertEqual(final.data_ptr(), hidden.data_ptr())
+
+    def test_boundary_profile_rejects_arithmetic_control_before_runtime_loading(self):
+        argv = ["score_decoder.py", "--hidden-boundary", "--exact-prefix", "--fp32-rope"]
+        with patch.object(sys, "argv", argv), patch.object(probe, "verify_runtime") as runtime:
+            with self.assertRaises(SystemExit):
+                probe.main()
+        runtime.assert_not_called()
+
     def test_continuation_margin_excludes_both_terminal_ids(self):
         logits = torch.zeros(151936, dtype=torch.bfloat16)
         logits[probe.EOS], logits[151643], logits[42] = 5, 4, 3

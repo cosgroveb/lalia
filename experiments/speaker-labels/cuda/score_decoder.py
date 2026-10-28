@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -90,7 +91,7 @@ def restore_fp32_rope(model):
     rotary.inv_freq = restored.to(rotary.inv_freq.device)
 
 
-def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK):
+def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK, capture_hidden=False):
     cache = None
     began = time.monotonic()
     device = model.embed_tokens.weight.device
@@ -106,7 +107,8 @@ def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK):
         if any(cache.get_seq_length(i) != end for i in range(model.config.num_hidden_layers)):
             raise ValueError("Cache layer lengths disagree")
         if end == embeddings.shape[0]:
-            logits = torch.nn.functional.linear(output.last_hidden_state[:, -1], model.embed_tokens.weight)
+            final = output.last_hidden_state[:, -1]
+            logits = torch.nn.functional.linear(final, model.embed_tokens.weight)
         del output
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -114,7 +116,7 @@ def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK):
         report({"consumed": end, "seconds": time.monotonic() - began})
     if logits.dtype != torch.bfloat16:
         raise ValueError("Expected native BF16 logits")
-    return logits[0], cache
+    return (logits[0], cache, final) if capture_hidden else (logits[0], cache)
 
 
 def summary(logits):
@@ -163,7 +165,7 @@ def cuda_smoke(stage="tiny"):
     return run_smoke(stage)
 
 
-def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK):
+def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK, boundary_inputs=None):
     metadata = {**metadata, "expected_consumed": embeddings.shape[0],
                 "expected_final_position": embeddings.shape[0] - 1}
     (out / "started.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -176,7 +178,10 @@ def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK):
         if row["available_bytes"] < 8 * GIB:
             raise MemoryError("MemAvailable below 8 GiB")
     with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16), fused_attention():
-        logits, cache = score(model, embeddings, report=report, chunk_size=chunk_size)
+        if boundary_inputs is None:
+            logits, cache = score(model, embeddings, report=report, chunk_size=chunk_size)
+        else:
+            logits, cache, final = score(model, embeddings, report=report, chunk_size=chunk_size, capture_hidden=True)
     logits_path = out / "logits.safetensors"
     save_file({"logits": logits.detach().cpu().contiguous()}, logits_path)
     consumed = progress[-1]["consumed"]
@@ -186,6 +191,11 @@ def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK):
               "consumed": consumed, "final_position": consumed - 1,
               "logits_file": logits_path.name, "logits_file_sha256": sha256(logits_path),
               "peak_cuda_bytes": torch.cuda.max_memory_allocated(), "cache_tokens": cache.get_seq_length()}
+    if boundary_inputs is not None:
+        from hidden_boundary import torch_capture_heads
+
+        result["boundary"] = torch_capture_heads(final, logits, model.embed_tokens.weight, out, boundary_inputs)
+        result["peak_cuda_bytes"] = torch.cuda.max_memory_allocated()
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
 
@@ -199,12 +209,17 @@ def main():
     parser.add_argument("--fp32-rope", action="store_true")
     parser.add_argument("--exact-prefix", action="store_true",
                         help="Score the captured 101135-input prefix in 4096-token chunks")
+    parser.add_argument("--hidden-boundary", action="store_true")
     args = parser.parse_args()
     total, chunk = (EXACT_TOTAL, EXACT_CHUNK) if args.exact_prefix else (TOTAL, CHUNK)
     if args.exact_prefix and (args.cuda_smoke or args.cuda_shapes):
         parser.error("--exact-prefix requires scoring")
     if args.fp32_rope and (args.cuda_smoke or args.cuda_shapes):
         parser.error("--fp32-rope requires scoring")
+    if args.hidden_boundary and (not args.exact_prefix or args.fp32_rope or args.cuda_smoke or args.cuda_shapes):
+        parser.error("--hidden-boundary requires the unchanged exact-prefix scorer")
+    if args.hidden_boundary:
+        os.umask(0o077)
     torch.set_num_threads(2)
     dependencies = verify_runtime()
     if args.cuda_smoke or args.cuda_shapes:
@@ -223,6 +238,12 @@ def main():
     for name, digest in manifest["files"].items():
         if sha256(args.inputs / name) != digest:
             raise ValueError(f"Input hash mismatch: {name}")
+    if args.hidden_boundary:
+        from hidden_boundary import read_torch
+
+        if manifest.get("hidden_boundary") is not True:
+            raise ValueError("Missing hidden-boundary input contract")
+        read_torch(args.inputs, "mac")
     import transformers
     root = Path(transformers.__file__).parent
     for name, digest in manifest["transformers_sources"].items():
@@ -264,7 +285,8 @@ def main():
                 "model_revision": manifest["model_revision"], "chunk": chunk, "exact_prefix": args.exact_prefix,
                 "attn_implementation": config._attn_implementation, "math_sdpa_enabled": False,
                 "loader": "Pinned official ModelRunner BF16 cast, decoder only"}
-    print(json.dumps(record_score(model, embeddings, args.out, metadata, chunk_size=chunk)))
+    print(json.dumps(record_score(model, embeddings, args.out, metadata, chunk_size=chunk,
+                                  boundary_inputs=args.inputs if args.hidden_boundary else None)))
 
 
 if __name__ == "__main__":

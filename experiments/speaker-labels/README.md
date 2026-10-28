@@ -719,6 +719,80 @@ sources matched, all owned processes exited, production returned HTTP 200 and
 swap did not grow. Frozen vectors, preflight observations and cleanup receipts
 remain under `~/.local/state/lalia-speaker-qualification/residual-silu-20261028`.
 
+### Final hidden-state boundary comparison
+
+Use `residual_rope.py --prepare --boundary capture` to freeze one native Mac
+prefix replay. It retains the final normalized `[1,1,1024]` hidden tensor,
+evaluates the original embedding projection, and saves hidden/logit BF16 bytes
+only after both historical full-vector gates pass. It generates no tokens.
+
+After a completed capture and cleanup, run the frozen source with
+`--export-hidden-cuda /path/to/new-bundle`. The bundle includes the verified
+archived inputs, Mac capture and reviewed source. The archive predates the
+`score_profile` field. Preparation verifies its pinned scorer and recorded
+schedule against the historical protocol, then export adds the explicit
+`exact-prefix` profile to the new manifest. Transfer input symlink
+targets without macOS archive metadata and verify the exact inventory, then run
+`probe/supervise.py hidden-kernel --root /path/to/bundle`
+with Python `-B`. This bounded kernel check uses the archived decoder image,
+host UID/GID, executable `/tmp` and task-owned cache paths. It checks private
+output ownership without pausing production. It leaves `HOME` unchanged.
+
+Only after that preflight passes, use `score --exact-prefix --hidden-boundary`
+with the same supervisor. It requires a fresh reading of both vLLM running
+and waiting gauges, with every series finite and zero, before pausing the main
+service. The check and stop are not atomic. Missing or busy metrics stop the
+trial without a service stop or restart. Capture retains the original CUDA
+`[1,1024]` projection, requires its full historical logits, and checks a
+serialized self-projection before projecting the Mac hidden state.
+
+If hidden bytes differ, prepare the final Mac phase with `--boundary heads`,
+`--capture-state /path/to/mac-capture` and `--cuda-state /path/to/results/score`.
+Its 60-second worker loads only the pinned embedding tensor and performs the
+same self/cross gates through native `Embedding.as_linear`. Analyze the four
+raw vectors with `hidden_boundary.analyze`. Its shared CPU FP64 normalization
+is analysis, not native generation probabilities. Identical hidden bytes stop
+the trial after the original projections, without extra head work.
+
+Mac capture retains the 300-second worker, 600-second total and 32 GiB bounds.
+CUDA capture retains 300 seconds and 24 GiB, with bounded restoration inside
+the reviewed 1,200-second outer launch. Freeze that launcher before execution.
+Use nice 10 and two CPU threads on Mac. Any gate or cleanup failure invalidates
+dependent work. It can locate a discrepancy at one prefix, not establish
+recovery of transcription or identify a defective kernel.
+
+October 28 results reproduced both historical full vectors and both serialized
+self-projections. The leading-token decision follows the hidden state:
+
+| Hidden state | Native head | EOS | Token 3821 | EOS margin | Argmax |
+|---|---|---:|---:|---:|---:|
+| Mac | Mac | 19.500 | 19.250 | +0.25 | 151645 |
+| Mac | CUDA | 19.500 | 19.250 | +0.25 | 151645 |
+| CUDA | Mac | 19.375 | 19.375 | 0 | 3821 |
+| CUDA | CUDA | 19.375 | 19.375 | 0 | 3821 |
+
+The normalized hidden states differ at 966 of 1,024 BF16 values, with maximum
+absolute difference 0.75 and mean 0.09959. Holding hidden input fixed, the heads
+differ at nine vocabulary entries for Mac hidden and eleven for CUDA hidden,
+with maximum difference 0.03125. None changes EOS or token 3821. This locates
+the observed decision difference upstream of the tied projection at this
+prefix. It does not identify the earlier operation or distinguish defective
+math from accumulated BF16/backend variation. No tokens were generated.
+
+The Mac timer recorded 36.79 seconds from worker entry through validation,
+loading, replay and vector comparison, before hidden capture and cleanup.
+Sampled physical peak was 24.24 GiB. CUDA recorded 63.34 seconds around its
+decoder loop and 14.08 GiB peak CUDA allocation. These timing and memory scopes
+differ. The final Mac head-only worker took 3.19 seconds at 2.03 GiB physical.
+
+Independent CPU recomputation passed. All 1,604 unique protocol pins and 21
+frozen artifacts matched. Owned processes and containers exited, production
+health/configuration and Spark sidecars matched, and swap did not grow. The
+initial transfer stopped on AppleDouble metadata before CUDA execution. Its
+reviewed metadata-free correction passed, with the failed stage preserved
+and no inference retry. Evidence is under
+`/tmp/unified-coordinator-lalia-speaker-labels/hidden-boundary-20261028`.
+
 ### Official full CUDA comparison
 
 Run the official audio frontend and generation helper to distinguish a

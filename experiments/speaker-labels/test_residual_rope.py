@@ -194,7 +194,7 @@ class ResidualRoPETests(unittest.TestCase):
             self.assertEqual(arms, ["baseline", "candidate"])
 
     def test_arm_deadline_counts_worker_setup(self):
-        for arm, elapsed in (("baseline", 301), ("silu-preflight", 31)):
+        for arm, elapsed in (("baseline", 301), ("silu-preflight", 31), ("head", 61)):
             with self.subTest(arm=arm), tempfile.TemporaryDirectory() as temporary:
                 state = Path(temporary)
                 guard = Mock(children=[], samples=[])
@@ -204,6 +204,22 @@ class ResidualRoPETests(unittest.TestCase):
                     with self.assertRaisesRegex(TimeoutError, "including setup"):
                         probe.run_arm(state, arm, {"commands": {arm: ["unused"]}}, guard)
                 guard.launch.assert_called_once()
+
+    def test_boundary_capture_runs_only_baseline_and_preserves_postflight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            state = Path(temporary)
+            with patch.object(probe, "frozen", return_value={"boundary": "capture", "arms": ["baseline"]}), \
+                    patch.object(probe, "verify"), patch.object(probe, "health", return_value=200), \
+                    patch.object(probe, "power", return_value="power"), patch.object(probe.ReplayGuard, "check"), \
+                    patch.object(probe.os, "getpriority", return_value=10), \
+                    patch.object(probe, "run_arm", return_value=baseline()) as run, \
+                    patch("hidden_boundary.capture_receipt") as capture:
+                probe.execute(state)
+            self.assertEqual([call.args[1] for call in run.call_args_list], ["baseline"])
+            capture.assert_called_once_with(state / "baseline", "mac")
+            result = json.loads((state / "result.json").read_text())
+            self.assertEqual(result["status"], "complete")
+            self.assertTrue(result["cleanup"])
 
     def test_preflight_dispatch_precedes_replay_thread_initialization(self):
         with tempfile.TemporaryDirectory() as temporary:

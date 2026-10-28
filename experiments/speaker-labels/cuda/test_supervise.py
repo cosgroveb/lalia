@@ -1,10 +1,13 @@
 from contextlib import redirect_stdout
+import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import signal
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import supervise
 
@@ -24,6 +27,7 @@ class FakeDocker:
         self.active = True
         self.calls = []
         self.waits = 0
+        self.metrics = 'vllm:num_requests_running{engine="0"} 0\nvllm:num_requests_waiting{engine="0"} 0\n'
 
     def call(self, args, timeout):
         assert timeout > 0
@@ -36,6 +40,13 @@ class FakeDocker:
             Path(args[args.index("--cidfile") + 1]).write_text(CID)
             if self.create_failure:
                 raise RuntimeError("create response lost")
+            return CID
+        if args[:3] == ["docker", "image", "inspect"]:
+            return supervise.EXACT_PREFIX_IMAGE
+        if args[:2] == ["docker", "inspect"]:
+            return supervise.PRODUCTION_IMAGE
+        if args[:2] == ["docker", "rm"]:
+            self.exists = False
             return CID
         if args[:2] == ["docker", "stop"]:
             if self.stop_not_found:
@@ -62,6 +73,8 @@ class FakeDocker:
                 supervise.interrupted(signal.SIGTERM, None)
             if not self.active:
                 raise RuntimeError("service unavailable")
+            if args[-1].endswith("/metrics"):
+                return self.metrics
             return ""
         if args[:2] == ["systemctl", "is-active"]:
             return ""
@@ -89,6 +102,121 @@ class ImmediateHealthSupervisor(supervise.Supervisor):
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_hidden_source_inventory_rejects_extra_or_changed_files(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            probe = root / "probe"
+            probe.mkdir()
+            source = probe / "worker.py"
+            source.write_text("original")
+            (root / "source-hashes.json").write_text(json.dumps({source.name: hashlib.sha256(source.read_bytes()).hexdigest()}))
+            runner = supervise.Supervisor(root, "hidden-kernel")
+            runner.source_hash()
+            extra = probe / "unexpected.py"
+            extra.write_text("extra")
+            with self.assertRaisesRegex(ValueError, "inventory differs"):
+                runner.source_hash()
+            extra.unlink()
+            source.write_text("changed")
+            with self.assertRaisesRegex(ValueError, "source differs"):
+                runner.source_hash()
+
+    def test_idle_gauges_require_both_families_and_every_series_zero(self):
+        valid = '# HELP ignored\nvllm:num_requests_running{engine="0"} 0\nvllm:num_requests_waiting{engine="0"} 0.0\n'
+        self.assertEqual(supervise.idle_metrics(valid)["vllm:num_requests_running"], [0.0])
+        for text in ("", valid.splitlines()[1], valid + 'vllm:num_requests_waiting{engine="1"} 1\n',
+                     valid.replace("0.0", "NaN"), valid.replace("0.0", "Inf"),
+                     valid.replace("0.0", "bad"), valid + "vllm:num_requests_running{broken\n"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                supervise.idle_metrics(text)
+
+    def test_idle_gauges_validate_label_syntax_and_unique_keys(self):
+        waiting = "\nvllm:num_requests_waiting 0\n"
+        for labels in ('{broken}', '{engine=0}', '{engine="0",engine="1"}',
+                       '{engine="0" engine="1"}', '{engine="0",,}', '{1engine="0"}',
+                       r'{engine="bad\t"}', '{engine="unterminated}', '{= "0"}'):
+            with self.subTest(labels=labels), self.assertRaises(ValueError):
+                supervise.idle_metrics("vllm:num_requests_running" + labels + " 0" + waiting)
+        for labels in ('{}', '{ }', '{engine="0", model_name="qwen3-coder-next"}',
+                       r'{engine="quote\" slash\\ newline\n {braces},equals=",}',
+                       '{ engine = "0" , model_name = "qwen" }'):
+            with self.subTest(labels=labels):
+                self.assertEqual(supervise.idle_metrics("vllm:num_requests_running" + labels + " 0" + waiting)
+                                 ["vllm:num_requests_running"], [0.0])
+
+    def test_hidden_idle_refusal_never_pauses_restarts_or_starts_container(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(supervise.Supervisor, "source_hash", return_value="f" * 64), \
+                patch.object(supervise.Supervisor, "verify_hidden_kernel"), \
+                patch.object(supervise.Supervisor, "verify_boundary_inputs"):
+            for index, sample in enumerate((' 1', '{broken} 0', '{engine=0} 0', '{engine="0",engine="1"} 0')):
+                with self.subTest(sample=sample):
+                    fake = FakeDocker()
+                    fake.metrics = "vllm:num_requests_running" + sample + "\nvllm:num_requests_waiting 0\n"
+                    runner = ImmediateHealthSupervisor(Path(temporary) / str(index), "score", fake.call, fake.popen,
+                                                       exact_prefix=True, hidden_boundary=True)
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(runner.run(), 1)
+                    self.assertFalse(runner.pause_requested)
+                    self.assertTrue(fake.active)
+                    self.assertFalse(fake.exists)
+                    self.assertFalse(any(call[0] == "sudo" or call[:2] == ["docker", "start"] for call in fake.calls))
+                    self.assertIn("unstarted_owned_container_removed", runner.events)
+
+    def test_hidden_prepare_keeps_archived_image_uid_and_cache_environment(self):
+        fake = FakeDocker()
+        with tempfile.TemporaryDirectory() as temporary, patch.object(supervise.Supervisor, "source_hash", return_value="f" * 64):
+            runner = ImmediateHealthSupervisor(Path(temporary), "hidden-kernel", fake.call, fake.popen)
+            runner.prepare()
+            create = next(call for call in fake.calls if call[:2] == ["docker", "create"])
+            self.assertIn(supervise.EXACT_PREFIX_IMAGE, create)
+            self.assertEqual(create[create.index("--user") + 1], f"{os.getuid()}:{os.getgid()}")
+            self.assertIn("/tmp:rw,nosuid,exec,size=2g", create)
+            self.assertFalse("--read-only" in create)
+            for value in supervise.CACHE_ENV:
+                self.assertIn(value, create)
+            self.assertIn("60s", create)
+            self.assertEqual(create[create.index("--memory") + 1], "4g")
+            self.assertIn("mkdir -p /tmp/torch-kernels", create[-1])
+            self.assertFalse(any(call[0] == "sudo" for call in fake.calls))
+
+    def test_hidden_preflight_failure_stops_before_container_creation_or_pause(self):
+        fake = FakeDocker()
+        with tempfile.TemporaryDirectory() as temporary, patch.object(supervise.Supervisor, "source_hash", return_value="f" * 64), \
+                patch.object(supervise.Supervisor, "verify_hidden_kernel", side_effect=ValueError("preflight failed")):
+            runner = ImmediateHealthSupervisor(Path(temporary), "score", fake.call, fake.popen,
+                                               exact_prefix=True, hidden_boundary=True)
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.run(), 1)
+            self.assertFalse(any(call[0] == "sudo" or call[:2] == ["docker", "create"] for call in fake.calls))
+            self.assertTrue(fake.active)
+
+    def test_hidden_kernel_receipt_requires_cache_execution_and_private_host_output(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(supervise.Supervisor, "source_hash", return_value="f" * 64):
+            root = Path(temporary)
+            private = root / "private-output"
+            private.mkdir(mode=0o700)
+            output = private / "check.json"
+            output.write_text(json.dumps({"uid": os.getuid(), "gid": os.getgid()}))
+            output.chmod(0o600)
+            receipt = {"status": "ready", "image": supervise.EXACT_PREFIX_IMAGE,
+                       "source_inventory_sha256": "f" * 64, "outer_product_max_error": 0,
+                       "cuda_peak_allocated_bytes": 11776, "root_read_only": False,
+                       "tmp_mount": "0 0 0:1 / /tmp rw - tmpfs tmpfs rw",
+                       "caches": {name: {"path": location, "files": {"compiled": {}}}
+                                  for name, location in (value.split("=", 1) for value in supervise.CACHE_ENV[2:])},
+                       "ownership": {"uid": os.getuid(), "gid": os.getgid(), "directory_mode": 0o700,
+                                     "file_uid": os.getuid(), "file_gid": os.getgid(), "file_mode": 0o600}}
+            runner = supervise.Supervisor(root, "hidden-kernel")
+            runner.require_hidden_kernel(receipt, root)
+            for field, value in (("image", "wrong"), ("source_inventory_sha256", "wrong"),
+                                 ("outer_product_max_error", 1), ("root_read_only", True),
+                                 ("tmp_mount", "0 0 0:1 / /tmp rw,noexec - tmpfs tmpfs rw")):
+                with self.subTest(field=field), self.assertRaises(ValueError):
+                    runner.require_hidden_kernel(dict(receipt, **{field: value}), root)
+            output.chmod(0o644)
+            with self.assertRaisesRegex(ValueError, "private modes"):
+                runner.require_hidden_kernel(receipt, root)
+
     def run_case(self, fake, mode="score", cid_collision=False, real_health=False, fp32_rope=False, exact_prefix=False):
         with tempfile.TemporaryDirectory() as directory:
             cls = supervise.Supervisor if real_health else ImmediateHealthSupervisor
