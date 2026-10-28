@@ -102,6 +102,54 @@ class ImmediateHealthSupervisor(supervise.Supervisor):
 
 
 class SupervisorTests(unittest.TestCase):
+    def test_midpoint_reuses_shared_input_mount_and_existing_limits(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.object(supervise.Supervisor, "source_hash", return_value="f" * 64), \
+                patch.object(supervise.Supervisor, "verify_hidden_kernel"), \
+                patch.object(supervise.Supervisor, "verify_boundary_inputs"), patch.object(supervise.Supervisor, "verify_midpoint"):
+            root = Path(temporary)
+            for phase in ("capture", "self", "cross"):
+                fake = FakeDocker()
+                shared = root / "verified-parent-inputs"
+                runner = ImmediateHealthSupervisor(root / phase, "score", fake.call, fake.popen,
+                                                    exact_prefix=True, midpoint=phase, shared_inputs=shared)
+                runner.prepare()
+                create = next(call for call in fake.calls if call[:2] == ["docker", "create"])
+                self.assertEqual(runner.work.name, "midpoint-" + phase)
+                self.assertIn(f"{shared.resolve()}:/inputs:ro", create)
+                self.assertIn(f"{runner.root}:/trial:ro", create)
+                self.assertIn("300s", create)
+                self.assertEqual(create[create.index("--memory") + 1], "24g")
+                self.assertIn(supervise.EXACT_PREFIX_IMAGE, create)
+                self.assertIn(f"--midpoint-config /trial/midpoint-{phase}.json", create[-1])
+                self.assertNotIn("--hidden-boundary", create[-1])
+                self.assertFalse(any(call[0] == "sudo" for call in fake.calls))
+
+    def test_midpoint_gate_failure_prevents_container_creation_or_pause(self):
+        fake = FakeDocker()
+        with tempfile.TemporaryDirectory() as temporary, patch.object(supervise.Supervisor, "source_hash", return_value="f" * 64), \
+                patch.object(supervise.Supervisor, "verify_hidden_kernel"), \
+                patch.object(supervise.Supervisor, "verify_boundary_inputs"), \
+                patch.object(supervise.Supervisor, "verify_midpoint", side_effect=ValueError("self gate failed")):
+            runner = ImmediateHealthSupervisor(Path(temporary), "score", fake.call, fake.popen,
+                                                exact_prefix=True, midpoint="cross")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.run(), 1)
+            self.assertFalse(any(call[0] == "sudo" or call[:2] == ["docker", "create"] for call in fake.calls))
+
+    def test_midpoint_busy_gate_never_starts_or_restarts_service(self):
+        fake = FakeDocker()
+        fake.metrics = "vllm:num_requests_running 1\nvllm:num_requests_waiting 0\n"
+        with tempfile.TemporaryDirectory() as temporary, patch.object(supervise.Supervisor, "source_hash", return_value="f" * 64), \
+                patch.object(supervise.Supervisor, "verify_hidden_kernel"), \
+                patch.object(supervise.Supervisor, "verify_boundary_inputs"), patch.object(supervise.Supervisor, "verify_midpoint"):
+            runner = ImmediateHealthSupervisor(Path(temporary), "score", fake.call, fake.popen,
+                                                exact_prefix=True, midpoint="self")
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(runner.run(), 1)
+            self.assertFalse(runner.pause_requested)
+            self.assertFalse(any(call[0] == "sudo" or call[:2] == ["docker", "start"] for call in fake.calls))
+            self.assertIn("unstarted_owned_container_removed", runner.events)
+
     def test_hidden_source_inventory_rejects_extra_or_changed_files(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

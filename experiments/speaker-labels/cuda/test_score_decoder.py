@@ -64,6 +64,61 @@ class ProbeTests(unittest.TestCase):
                 probe.main()
         runtime.assert_not_called()
 
+    def test_midpoint_rejects_other_profiles_before_runtime_loading(self):
+        for extra in (("--fp32-rope",), ("--hidden-boundary",), ("--cuda-smoke",)):
+            argv = ["score_decoder.py", "--midpoint-config", "unused", "--exact-prefix", *extra]
+            with self.subTest(extra=extra), patch.object(sys, "argv", argv), patch.object(probe, "verify_runtime") as runtime:
+                with self.assertRaises(SystemExit):
+                    probe.main()
+                runtime.assert_not_called()
+
+    def test_midpoint_capture_and_self_replay_keep_native_decoder_and_kv_history(self):
+        import midpoint
+
+        torch.manual_seed(42)
+        model = probe.empty_decoder(config()).to(dtype=torch.bfloat16).eval()
+        for parameter in model.parameters():
+            torch.nn.init.uniform_(parameter, -0.125, 0.125)
+        embeddings = torch.randn(13, 16, dtype=torch.bfloat16)
+        with torch.inference_mode():
+            raw, _, final = probe.score(model, embeddings, chunk_size=4, capture_hidden=True)
+        with tempfile.TemporaryDirectory() as temporary, patch.multiple(midpoint, TOTAL=13, CHUNK=4, CUT=1,
+                WIDTH=16, VOCAB=32, SHAPES={"cuda": (1, 16)},
+                HIDDEN_SHA={"cuda": midpoint.torch_digest(final)}, RAW_SHA={"cuda": midpoint.torch_digest(raw)},
+                WEIGHT_SHA=midpoint.torch_digest(model.embed_tokens.weight)), patch.object(midpoint, "validate_config"):
+            root = Path(temporary)
+            capture = root / "capture"
+            capture.mkdir()
+            cfg = {"backend": "cuda", "phase": "capture", "sequence": None, "input_manifest_sha256": None}
+            observer = midpoint.Midpoint(root, cfg, capture)
+            hook = midpoint.install_torch(model.layers, observer)
+            try:
+                with torch.inference_mode():
+                    observed, cache, observed_final = probe.score(model, embeddings, chunk_size=4,
+                                                                  capture_hidden=True, midpoint=observer)
+                measured = observer.complete(observed_final, observed, model.embed_tokens.weight)
+            finally:
+                hook.remove()
+            self.assertTrue(torch.equal(observed, raw))
+            self.assertTrue(torch.equal(observed_final, final))
+            self.assertEqual([cache.get_seq_length(i) for i in range(2)], [13, 13])
+            replay = root / "self"
+            replay.mkdir()
+            cfg = {"backend": "cuda", "phase": "self", "source_backend": "cuda", "sequence": "capture/sequence",
+                   "input_manifest_sha256": measured["sequence_sha256"]}
+            observer = midpoint.Midpoint(root, cfg, replay)
+            hook = midpoint.install_torch(model.layers, observer)
+            try:
+                with torch.inference_mode():
+                    observed, cache, observed_final = probe.score(model, embeddings, chunk_size=4,
+                                                                  capture_hidden=True, midpoint=observer)
+                observer.complete(observed_final, observed, model.embed_tokens.weight)
+            finally:
+                hook.remove()
+            self.assertTrue(torch.equal(observed, raw))
+            self.assertTrue(torch.equal(observed_final, final))
+            self.assertEqual([cache.get_seq_length(i) for i in range(2)], [13, 13])
+
     def test_continuation_margin_excludes_both_terminal_ids(self):
         logits = torch.zeros(151936, dtype=torch.bfloat16)
         logits[probe.EOS], logits[151643], logits[42] = 5, 4, 3

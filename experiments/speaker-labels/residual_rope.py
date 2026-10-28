@@ -122,12 +122,17 @@ def archived_cuda_inputs():
     return manifest, hashes
 
 
-def prepare(state, activation=None, boundary=None, capture_state=None, cuda_state=None):
+def prepare(state, activation=None, boundary=None, capture_state=None, cuda_state=None, *,
+            midpoint_phase=None, midpoint_source=None, mac_self=None, cuda_self=None):
     """Hash existing evidence and copy reviewed sources. Never import model libraries."""
     if activation not in (None, "full-silu-bf16"):
         raise ValueError("Unknown activation comparison")
     if boundary not in (None, "capture", "heads") or (boundary and activation):
         raise ValueError("Choose one fixed comparison")
+    if midpoint_phase not in (None, "capture", "self", "cross") or midpoint_phase and (activation or boundary):
+        raise ValueError("Choose one fixed midpoint pass")
+    if not midpoint_phase and any(p is not None for p in (midpoint_source, mac_self, cuda_self)):
+        raise ValueError("Midpoint prerequisites require a midpoint pass")
     if ((boundary == "heads" and (capture_state is None or cuda_state is None))
             or (boundary != "heads" and (capture_state is not None or cuda_state is not None))):
         raise ValueError("Head replay requires both completed capture directories")
@@ -162,11 +167,18 @@ def prepare(state, activation=None, boundary=None, capture_state=None, cuda_stat
         raise ValueError("Model revision differs")
     paths = [HISTORICAL / name for name in ("protocol.json", "protocol.sha256", "result.json", "scores.safetensors", "cuda-normalized-comparison.json")]
     helpers = HELPERS + (("residual_silu.py", "test_residual_silu.py") if activation else ())
-    if boundary:
+    if boundary or midpoint_phase:
         helpers += ("hidden_boundary.py", "test_hidden_boundary.py")
         helpers += tuple("cuda/" + name for name in BOUNDARY_CUDA)
+    if midpoint_phase:
+        from midpoint import historical_pins, phase_config, validate_config
+
+        helpers += ("midpoint.py", "test_midpoint.py")
+        hashes.update(historical_pins())
+        midpoint_config = phase_config(state.parent, "mac", midpoint_phase, midpoint_source, mac_self, cuda_self)
+        hashes.update(validate_config(state.parent, midpoint_config, "mac"))
     paths += [ARCHIVE, CUDA, PYTHON.resolve(), *(SOURCE / name for name in helpers + PROTECTED)]
-    if boundary:
+    if boundary or midpoint_phase:
         paths.append(Path("/tmp/unified-coordinator-lalia-speaker-labels/next-hidden-boundary-proposal-20261028.md"))
         _, archive_hashes = archived_cuda_inputs()
         hashes.update(archive_hashes)
@@ -187,6 +199,8 @@ def prepare(state, activation=None, boundary=None, capture_state=None, cuda_stat
     if boundary:
         scope = "Final hidden boundary " + boundary
     arms = ("head",) if boundary == "heads" else (("baseline",) if boundary == "capture" else ("baseline", "candidate"))
+    if midpoint_phase:
+        scope, arms = "Midpoint " + midpoint_phase, ("midpoint",)
     protocol = {"scope": scope + ". No token generation or CUDA execution.", "activation": activation,
                 "boundary": boundary, "arms": list(arms),
                 "capture_state": str(capture_state) if capture_state else None,
@@ -209,6 +223,9 @@ def prepare(state, activation=None, boundary=None, capture_state=None, cuda_stat
         protocol["limits"]["preflight_seconds"] = 30
     if boundary == "heads":
         protocol["limits"]["head_seconds"] = 60
+    if midpoint_phase:
+        protocol.update(midpoint=midpoint_config, midpoint_root=str(state.parent),
+                        operators={"midpoint": "NativeBF16RoPE(131072)"})
     save(state / "protocol.json", protocol)
     (state / "protocol.sha256").write_text(sha256(state / "protocol.json") + "\n")
     return protocol
@@ -270,6 +287,33 @@ def export_hidden_cuda(state, output):
     for name in BOUNDARY_CUDA:
         shutil.copy2(SOURCE / "cuda" / name, probe / name)
     shutil.copy2(SOURCE / "hidden_boundary.py", probe / "hidden_boundary.py")
+    save(output / "source-hashes.json", {path.name: sha256(path) for path in probe.iterdir()})
+
+
+def export_midpoint_cuda(state, output):
+    from midpoint import completed_run
+
+    protocol = frozen(state)
+    if protocol.get("midpoint", {}).get("phase") != "self":
+        raise ValueError("Export requires the completed Mac self-replay")
+    _, _, own_files = completed_run(state, "mac", "self")
+    capture = Path(protocol["midpoint_root"]) / protocol["midpoint"]["source"]
+    _, _, capture_files = completed_run(capture, "mac", "capture")
+    if output.exists():
+        raise ValueError("Midpoint CUDA bundle exists. No overwrite")
+    probe = output / "probe"
+    probe.mkdir(parents=True, mode=0o700)
+    for source, files, name in ((state, own_files, "mac-self"), (capture, capture_files, "mac-capture")):
+        for path in files:
+            target = output / "prerequisites" / name / path.relative_to(source)
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            shutil.copy2(path, target)
+    for name in BOUNDARY_CUDA:
+        shutil.copy2(SOURCE / "cuda" / name, probe / name)
+    for name in ("hidden_boundary.py", "midpoint.py"):
+        shutil.copy2(SOURCE / name, probe / name)
+    # The immutable parent input directory is mounted read-only on Spark.
+    (output / "input-manifest.sha256").write_text("7c897e494e9b790bd1c328262651338aeb0304eac2adb1ab324dcb49e7168756\n")
     save(output / "source-hashes.json", {path.name: sha256(path) for path in probe.iterdir()})
 
 
@@ -340,6 +384,9 @@ def worker(state, arm):
     if os.getpriority(os.PRIO_PROCESS, 0) < 10:
         raise ValueError("Require nice 10 or lower scheduling priority")
     activation = protocol.get("activation")
+    midpoint_config = protocol.get("midpoint")
+    if (arm == "midpoint") != bool(midpoint_config):
+        raise ValueError("Midpoint worker requires its fixed pass configuration")
     if protocol.get("boundary") == "heads" and arm != "head":
         raise ValueError("Head comparison runs only the head worker")
     if arm == "head":
@@ -383,7 +430,7 @@ def worker(state, arm):
     import torch
     from mlx_audio.stt.utils import load_model
 
-    if protocol.get("boundary") and mx.default_device() != mx.gpu:
+    if (protocol.get("boundary") or midpoint_config) and mx.default_device() != mx.gpu:
         raise ValueError("Boundary capture requires Metal")
     torch.set_num_threads(2)
     torch.set_num_interop_threads(2)
@@ -395,9 +442,9 @@ def worker(state, arm):
     if (config.head_dim, config.rope_theta, config.max_position_embeddings, len(model.layers)) != (128, 1000000, 131072, 28):
         raise ValueError("Unexpected MOSS architecture")
     activation_report = select_activation(model, arm, BASE / "runtime") if activation else None
-    if protocol.get("boundary") == "capture" and model.lm_head is not None:
+    if (protocol.get("boundary") == "capture" or midpoint_config) and model.lm_head is not None:
         raise ValueError("Boundary capture requires the tied embedding head")
-    rope = select_operator(arm, activation)
+    rope = select_operator("baseline" if midpoint_config else arm, activation)
     for layer in model.layers:
         layer.self_attn.rope = rope
     tables = {}
@@ -417,15 +464,27 @@ def worker(state, arm):
     if digest.hexdigest() != CONTENT_SHA:
         raise ValueError("Embedding content differs")
     cache = model.make_cache()
+    observer, original_layer = None, None
     try:
         if len(cache) != 28:
             raise ValueError("Unexpected KV cache count")
+        if midpoint_config:
+            from midpoint import CUT, Midpoint, install_mlx
+
+            observer = Midpoint(Path(protocol["midpoint_root"]), midpoint_config, directory)
+            original_layer = install_mlx(model.layers, observer)
         for start, end in chunks(TOTAL, CHUNK):
             if any(item.offset != start for item in cache):
                 raise ValueError("KV offset differs from captured prefix")
+            if observer:
+                observer.begin(start, end)
             hidden = model.model.language_model(inputs_embeds=embeddings[None, start:end], cache=cache)
             mx.eval(hidden, [item.state for item in cache])
             mx.clear_cache()
+            if observer:
+                if any(item.offset != end or any(value.dtype != mx.bfloat16 for value in item.state) for item in cache):
+                    raise ValueError("Midpoint cache position/dtype differs")
+                observer.finish()
             save(directory / "progress.json", {"consumed": end, "elapsed_seconds": time.monotonic() - began})
         offsets = [item.offset for item in cache]
         if offsets != [TOTAL] * 28:
@@ -462,8 +521,14 @@ def worker(state, arm):
 
             require_baseline(result)
             result["head_capture"] = capture_mlx(final, raw, model.model.language_model.embed_tokens, directory)
+        if observer:
+            if midpoint_config["phase"] != "cross":
+                require_baseline(result)
+            result["midpoint"] = observer.complete(final, raw, model.model.language_model.embed_tokens.weight)
         save(directory / "result.json", result)
     finally:
+        if original_layer is not None:
+            model.layers[CUT] = original_layer
         cache.clear()
         gc.collect()
         mx.synchronize()
@@ -675,25 +740,36 @@ def main():
     mode.add_argument("--prepare", action="store_true")
     mode.add_argument("--run", action="store_true")
     mode.add_argument("--export-hidden-cuda", type=Path)
-    mode.add_argument("--worker", choices=("baseline", "candidate", "silu-preflight", "head"), help=argparse.SUPPRESS)
+    mode.add_argument("--export-midpoint-cuda", type=Path)
+    mode.add_argument("--worker", choices=("baseline", "candidate", "silu-preflight", "head", "midpoint"), help=argparse.SUPPRESS)
     parser.add_argument("--activation", choices=("full-silu-bf16",), help="Prepare the fixed SiLU comparison instead of rotary")
     parser.add_argument("--boundary", choices=("capture", "heads"))
     parser.add_argument("--capture-state", type=Path)
     parser.add_argument("--cuda-state", type=Path)
+    parser.add_argument("--midpoint", choices=("capture", "self", "cross"))
+    parser.add_argument("--midpoint-source", type=Path)
+    parser.add_argument("--mac-self", type=Path)
+    parser.add_argument("--cuda-self", type=Path)
     args = parser.parse_args()
-    if (args.activation or args.boundary or args.capture_state or args.cuda_state) and not args.prepare:
+    if any((args.activation, args.boundary, args.capture_state, args.cuda_state, args.midpoint,
+            args.midpoint_source, args.mac_self, args.cuda_self)) and not args.prepare:
         parser.error("Comparison options require --prepare; later modes use the frozen protocol")
     signal.signal(signal.SIGINT, interrupt)
     signal.signal(signal.SIGTERM, interrupt)
     if args.prepare:
         protocol = prepare(args.state.resolve(), args.activation, args.boundary,
                            args.capture_state.resolve() if args.capture_state else None,
-                           args.cuda_state.resolve() if args.cuda_state else None)
+                           args.cuda_state.resolve() if args.cuda_state else None,
+                           midpoint_phase=args.midpoint, midpoint_source=args.midpoint_source.resolve() if args.midpoint_source else None,
+                           mac_self=args.mac_self.resolve() if args.mac_self else None,
+                           cuda_self=args.cuda_self.resolve() if args.cuda_self else None)
         print(json.dumps({"pins": len(protocol["hashes"]), "inference_run": False}))
     elif args.run:
         execute(args.state.resolve())
     elif args.export_hidden_cuda:
         export_hidden_cuda(args.state.resolve(), args.export_hidden_cuda.resolve())
+    elif args.export_midpoint_cuda:
+        export_midpoint_cuda(args.state.resolve(), args.export_midpoint_cuda.resolve())
     else:
         worker(args.state.resolve(), args.worker)
 

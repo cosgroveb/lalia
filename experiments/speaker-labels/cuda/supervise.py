@@ -7,6 +7,7 @@ import math
 import os
 from pathlib import Path
 import re
+import shlex
 import signal
 import subprocess
 import time
@@ -68,22 +69,30 @@ def idle_metrics(text):
 
 class Supervisor:
     def __init__(self, root, mode, call=command, popen=subprocess.Popen, sleep=time.sleep, *, fp32_rope=False, exact_prefix=False,
-                 hidden_boundary=False):
+                 hidden_boundary=False, midpoint=None, shared_inputs=None):
         if fp32_rope and mode != "score":
             raise ValueError("--fp32-rope requires score mode")
         if exact_prefix and mode not in ("score", "hidden-kernel"):
             raise ValueError("--exact-prefix requires score mode")
         if mode == "hidden-kernel":
             hidden_boundary, exact_prefix = True, True
+        if midpoint:
+            if midpoint not in ("capture", "self", "cross") or mode != "score" or not exact_prefix or fp32_rope or hidden_boundary:
+                raise ValueError("Midpoint requires only the unchanged exact-prefix score profile")
+            hidden_boundary = True
+        if shared_inputs is not None and not hidden_boundary:
+            raise ValueError("Shared inputs require the reviewed boundary runtime")
         if hidden_boundary and (mode not in ("score", "hidden-kernel") or not exact_prefix or fp32_rope):
             raise ValueError("Hidden boundary requires the unchanged exact-prefix profile")
         self.hidden_boundary = hidden_boundary
         self.exact_prefix = exact_prefix
         self.fp32_rope = fp32_rope
         self.root, self.mode = root.resolve(), mode
-        self.work = self.root / "results" / mode
+        self.midpoint = midpoint
+        self.inputs = shared_inputs.resolve() if shared_inputs is not None else self.root / "inputs"
+        self.work = self.root / "results" / ("midpoint-" + midpoint if midpoint else mode)
         self.cidfile = self.work / "container.cid"
-        self.name = f"lalia-moss-cuda-{mode}-20261027"
+        self.name = f"lalia-moss-cuda-midpoint-{midpoint}-20261028" if midpoint else f"lalia-moss-cuda-{mode}-20261027"
         self.owner = uuid.uuid4().hex
         self.call, self.popen, self.sleep = call, popen, sleep
         self.cid = None
@@ -121,7 +130,7 @@ class Supervisor:
     def verify_boundary_inputs(self):
         from hidden_boundary import capture_receipt, sha256
 
-        inputs = self.root / "inputs"
+        inputs = self.inputs
         if sha256(inputs / "manifest.json") != (self.root / "input-manifest.sha256").read_text().strip():
             raise ValueError("Boundary input manifest changed")
         manifest = json.loads((inputs / "manifest.json").read_text())
@@ -131,6 +140,17 @@ class Supervisor:
             if Path(name).name != name or sha256(inputs / name) != digest:
                 raise ValueError("Boundary input changed")
         capture_receipt(inputs, "mac")
+
+    def verify_midpoint(self):
+        from midpoint import validate_config
+
+        path = self.root / f"midpoint-{self.midpoint}.json"
+        if hashlib.sha256(path.read_bytes()).hexdigest() != path.with_suffix(".sha256").read_text().strip():
+            raise ValueError("Midpoint pass configuration changed")
+        config = json.loads(path.read_text())
+        if config["phase"] != self.midpoint:
+            raise ValueError("Midpoint pass differs")
+        validate_config(self.root, config, "cuda")
 
     def require_hidden_kernel(self, receipt, directory):
         if (receipt["status"] != "ready" or receipt["image"] != EXACT_PREFIX_IMAGE
@@ -198,6 +218,8 @@ class Supervisor:
             if self.mode == "score":
                 self.verify_hidden_kernel()
                 self.verify_boundary_inputs()
+                if self.midpoint:
+                    self.verify_midpoint()
         self.work.mkdir(parents=True, mode=0o700)
         self.created_work = True
         seconds, memory = {"smoke": (45, "2g"), "shapes": (120, "6g"), "decoder": (100, "4g"),
@@ -211,7 +233,7 @@ class Supervisor:
                 "--memory-swap", memory, "--cpus", "4",
                 "--volume", f"{self.root / 'probe'}:/probe:ro",
                 "--volume", f"{self.work}:/results",
-                "--volume", f"{self.root / 'inputs'}:/inputs:ro",
+                "--volume", f"{self.inputs}:/inputs:ro",
                 "--entrypoint", "timeout", EXACT_PREFIX_IMAGE if self.exact_prefix else IMAGE, "--signal=TERM", "--kill-after=5s",
                 f"{seconds}s", "python3", script]
         args += {"smoke": ["--cuda-smoke"], "shapes": ["--cuda-shapes"],
@@ -227,12 +249,16 @@ class Supervisor:
                           f"SOURCE_INVENTORY_SHA256={self.source_hash()}"):
                 settings += ["--env", value]
             args[position:position] = settings
+            if self.midpoint:
+                args[position:position] = ["--volume", f"{self.root}:/trial:ro"]
             index = args.index("python3")
             worker = args[index:]
-            if self.mode == "score":
+            if self.midpoint:
+                worker += ["--midpoint-config", f"/trial/midpoint-{self.midpoint}.json"]
+            elif self.mode == "score":
                 worker.append("--hidden-boundary")
             # Arguments are fixed paths/flags, not shell-supplied text.
-            args[index:] = ["sh", "-c", "mkdir -p /tmp/torch-kernels && exec " + " ".join(worker)]
+            args[index:] = ["sh", "-c", "mkdir -p /tmp/torch-kernels && exec " + shlex.join(worker)]
         self.call(args, 30)
         self.cid = self.cidfile.read_text().strip()
         if not re.fullmatch(r"[a-f0-9]{64}", self.cid) or self.containers(owned=True) != [self.cid]:
@@ -267,6 +293,16 @@ class Supervisor:
             self.require_hidden_kernel(receipt, self.work)
             (self.work / "kernel.json").write_text(json.dumps(receipt, indent=2) + "\n")
             self.events.append("hidden_kernel_verified")
+        elif self.midpoint:
+            from midpoint import final_receipt, read_sequence
+
+            receipt = json.loads((self.work / "model/result.json").read_text())["midpoint"]
+            if receipt["final"] != final_receipt(self.work / "model", "cuda", self.midpoint):
+                raise ValueError("Midpoint final result changed")
+            if self.midpoint == "capture":
+                read_sequence(self.work / "model/sequence", "cuda")
+            self.verify_midpoint()
+            self.events.append("midpoint_verified")
         elif self.hidden_boundary:
             from hidden_boundary import capture_receipt
 
@@ -371,7 +407,7 @@ class Supervisor:
                 for sig, handler in previous.items():
                     signal.signal(sig, handler)
         report = {"mode": self.mode, "fp32_rope": self.fp32_rope, "exact_prefix": self.exact_prefix,
-                  "hidden_boundary": self.hidden_boundary, "name": self.name, "cid": self.cid,
+                  "hidden_boundary": self.hidden_boundary, "midpoint": self.midpoint, "name": self.name, "cid": self.cid,
                   "owner_label": self.owner, "original_error": original,
                   "cleanup_errors": errors, "events": self.events}
         if self.created_work:
@@ -388,11 +424,14 @@ def main():
     parser.add_argument("--fp32-rope", action="store_true")
     parser.add_argument("--exact-prefix", action="store_true")
     parser.add_argument("--hidden-boundary", action="store_true")
+    parser.add_argument("--midpoint", choices=("capture", "self", "cross"))
+    parser.add_argument("--shared-inputs", type=Path)
     args = parser.parse_args()
     for sig in SIGNALS:
         signal.signal(sig, interrupted)
     raise SystemExit(Supervisor(args.root, args.mode, fp32_rope=args.fp32_rope, exact_prefix=args.exact_prefix,
-                               hidden_boundary=args.hidden_boundary).run())
+                               hidden_boundary=args.hidden_boundary, midpoint=args.midpoint,
+                               shared_inputs=args.shared_inputs).run())
 
 
 if __name__ == "__main__":

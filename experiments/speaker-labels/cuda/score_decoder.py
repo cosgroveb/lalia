@@ -91,13 +91,15 @@ def restore_fp32_rope(model):
     rotary.inv_freq = restored.to(rotary.inv_freq.device)
 
 
-def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK, capture_hidden=False):
+def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK, capture_hidden=False, midpoint=None):
     cache = None
     began = time.monotonic()
     device = model.embed_tokens.weight.device
     for start, end in chunks(embeddings.shape[0], chunk_size):
         if (cache.get_seq_length() if cache else 0) != start:
             raise ValueError("Unexpected cache position")
+        if midpoint:
+            midpoint.begin(start, end)
         output = model(
             inputs_embeds=embeddings[None, start:end].to(device),
             position_ids=torch.arange(start, end, device=device)[None],
@@ -106,6 +108,9 @@ def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK, captu
         cache = output.past_key_values
         if any(cache.get_seq_length(i) != end for i in range(model.config.num_hidden_layers)):
             raise ValueError("Cache layer lengths disagree")
+        if midpoint and (len(cache.layers) != model.config.num_hidden_layers
+                         or any(value.dtype != torch.bfloat16 for layer in cache.layers for value in (layer.keys, layer.values))):
+            raise ValueError("Midpoint CUDA cache dtype/count differs")
         if end == embeddings.shape[0]:
             final = output.last_hidden_state[:, -1]
             logits = torch.nn.functional.linear(final, model.embed_tokens.weight)
@@ -113,6 +118,8 @@ def score(model, embeddings, *, report=lambda row: None, chunk_size=CHUNK, captu
         if device.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
+        if midpoint:
+            midpoint.finish()
         report({"consumed": end, "seconds": time.monotonic() - began})
     if logits.dtype != torch.bfloat16:
         raise ValueError("Expected native BF16 logits")
@@ -165,7 +172,7 @@ def cuda_smoke(stage="tiny"):
     return run_smoke(stage)
 
 
-def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK, boundary_inputs=None):
+def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK, boundary_inputs=None, midpoint_config=None):
     metadata = {**metadata, "expected_consumed": embeddings.shape[0],
                 "expected_final_position": embeddings.shape[0] - 1}
     (out / "started.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -177,11 +184,25 @@ def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK, boundary
         (out / "progress.json").write_text(json.dumps(progress, indent=2) + "\n")
         if row["available_bytes"] < 8 * GIB:
             raise MemoryError("MemAvailable below 8 GiB")
-    with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16), fused_attention():
-        if boundary_inputs is None:
-            logits, cache = score(model, embeddings, report=report, chunk_size=chunk_size)
-        else:
-            logits, cache, final = score(model, embeddings, report=report, chunk_size=chunk_size, capture_hidden=True)
+    observer, hook = None, None
+    if midpoint_config:
+        from midpoint import Midpoint, install_torch
+
+        root, config = midpoint_config
+        observer = Midpoint(root, config, out)
+        hook = install_torch(model.layers, observer)
+    try:
+        with torch.inference_mode(), torch.amp.autocast("cuda", dtype=torch.bfloat16), fused_attention():
+            if observer:
+                logits, cache, final = score(model, embeddings, report=report, chunk_size=chunk_size,
+                                            capture_hidden=True, midpoint=observer)
+            elif boundary_inputs is None:
+                logits, cache = score(model, embeddings, report=report, chunk_size=chunk_size)
+            else:
+                logits, cache, final = score(model, embeddings, report=report, chunk_size=chunk_size, capture_hidden=True)
+    finally:
+        if hook:
+            hook.remove()
     logits_path = out / "logits.safetensors"
     save_file({"logits": logits.detach().cpu().contiguous()}, logits_path)
     consumed = progress[-1]["consumed"]
@@ -195,6 +216,9 @@ def record_score(model, embeddings, out, metadata, *, chunk_size=CHUNK, boundary
         from hidden_boundary import torch_capture_heads
 
         result["boundary"] = torch_capture_heads(final, logits, model.embed_tokens.weight, out, boundary_inputs)
+        result["peak_cuda_bytes"] = torch.cuda.max_memory_allocated()
+    if observer:
+        result["midpoint"] = observer.complete(final, logits, model.embed_tokens.weight)
         result["peak_cuda_bytes"] = torch.cuda.max_memory_allocated()
     (out / "result.json").write_text(json.dumps(result, indent=2) + "\n")
     return result
@@ -210,6 +234,7 @@ def main():
     parser.add_argument("--exact-prefix", action="store_true",
                         help="Score the captured 101135-input prefix in 4096-token chunks")
     parser.add_argument("--hidden-boundary", action="store_true")
+    parser.add_argument("--midpoint-config", type=Path)
     args = parser.parse_args()
     total, chunk = (EXACT_TOTAL, EXACT_CHUNK) if args.exact_prefix else (TOTAL, CHUNK)
     if args.exact_prefix and (args.cuda_smoke or args.cuda_shapes):
@@ -218,7 +243,18 @@ def main():
         parser.error("--fp32-rope requires scoring")
     if args.hidden_boundary and (not args.exact_prefix or args.fp32_rope or args.cuda_smoke or args.cuda_shapes):
         parser.error("--hidden-boundary requires the unchanged exact-prefix scorer")
-    if args.hidden_boundary:
+    if args.midpoint_config and (args.hidden_boundary or not args.exact_prefix or args.fp32_rope or args.cuda_smoke or args.cuda_shapes):
+        parser.error("--midpoint-config requires only the unchanged exact-prefix scorer")
+    midpoint_config = None
+    if args.midpoint_config:
+        from midpoint import validate_config
+
+        config = json.loads(args.midpoint_config.read_text())
+        if sha256(args.midpoint_config) != args.midpoint_config.with_suffix(".sha256").read_text().strip():
+            raise ValueError("Midpoint configuration changed")
+        validate_config(args.midpoint_config.parent, config, "cuda")
+        midpoint_config = (args.midpoint_config.parent, config)
+    if args.hidden_boundary or midpoint_config:
         os.umask(0o077)
     torch.set_num_threads(2)
     dependencies = verify_runtime()
@@ -254,6 +290,8 @@ def main():
     config = Qwen3Config(**json.loads((args.inputs / "config.json").read_text())["text_config"])
     config._attn_implementation = "sdpa"
     model = load_decoder(config, args.inputs / "model-00000-of-00001.safetensors")
+    if midpoint_config and (model.config.num_hidden_layers != 28 or model.config.hidden_size != 1024):
+        raise ValueError("Midpoint decoder architecture differs")
     original_rope_dtype = str(model.rotary_emb.inv_freq.dtype)
     original_rope_sha256 = tensor_sha256(model.rotary_emb.inv_freq)
     if args.fp32_rope:
@@ -286,7 +324,8 @@ def main():
                 "attn_implementation": config._attn_implementation, "math_sdpa_enabled": False,
                 "loader": "Pinned official ModelRunner BF16 cast, decoder only"}
     print(json.dumps(record_score(model, embeddings, args.out, metadata, chunk_size=chunk,
-                                  boundary_inputs=args.inputs if args.hidden_boundary else None)))
+                                  boundary_inputs=args.inputs if args.hidden_boundary else None,
+                                  midpoint_config=midpoint_config)))
 
 
 if __name__ == "__main__":

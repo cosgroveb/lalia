@@ -793,6 +793,79 @@ reviewed metadata-free correction passed, with the failed stage preserved
 and no inference retry. Evidence is under
 `/tmp/unified-coordinator-lalia-speaker-labels/hidden-boundary-20261028`.
 
+### Midpoint decoder comparison
+
+Use `residual_rope.py --prepare --midpoint capture --state /trial/mac-capture`
+to freeze one cut before block 14 of 28. Run each prepared state through its
+frozen `source/residual_rope.py --run` with the existing nice 10/two-thread
+launcher. Capture saves all 101,135 positions in 26 BF16 chunks. Self and cross
+passes substitute every chunk at that same boundary, so the receiving suffix
+rebuilds its entire KV history. A final-token-only substitution would not test
+the same question.
+
+Prepare `mac-self` with `--midpoint self --midpoint-source /trial/mac-capture`.
+Both native capture and saved self-replay must reproduce the historical full
+raw/normalized vectors and final hidden bytes. Every Mac pass explicitly keeps
+`NativeBF16RoPE(131072)`, including its pinned frequency/denominator bytes.
+Native model calls, masks, positions, cache indices, final norm and tied head
+stay in place. MLX may omit arithmetic whose overwritten output is unused.
+The existing evaluation of final output and all cache roots remains intact.
+Do not force unused work to make timings comparable.
+
+After Mac self-replay and cleanup pass, export with its frozen runner's
+`--export-midpoint-cuda /path/to/new-bundle`. This includes the Mac midpoint
+sequence and prerequisite receipts, plus reviewed source. Reuse the verified
+parent input directory on Spark with `--shared-inputs`, mounted read-only.
+Transfer only the new bundle with metadata-free exact-inventory checks.
+
+Run the existing `hidden-kernel` preflight against that input mount. Prepare
+each CUDA pass with `probe/midpoint.py --prepare-cuda <capture|self|cross>
+--root /path/to/trial`, then run `probe/supervise.py score --exact-prefix
+--midpoint <phase> --shared-inputs /path/to/verified-parent-inputs --root
+/path/to/trial`. Each pass gets its own output directory and fresh worker.
+Existing idle checks, mapped ownership and bounded service restoration apply.
+
+Run CUDA capture and self-replay before either cross pass. CUDA cross uses the
+Mac capture. After retrieving the completed CUDA receipts and sequence, prepare
+Mac cross with `--midpoint cross --midpoint-source /trial/cuda/midpoint-capture
+--mac-self /trial/mac-self --cuda-self /trial/cuda/midpoint-self`. All prerequisites must
+live under the same trial root. Both cross directions require completed native
+self gates and the exact donor sequence used by its self-replay.
+
+The fixed trial contains six passes, each with a 300-second worker limit.
+Mac retains its 600-second total and 32 GiB physical limit. CUDA retains its
+1,200-second outer bound, 24 GiB allocation/container limit and 8 GiB available
+floor. One midpoint sequence is 197.53 MiB. Analyze the four self/cross outputs
+with CPU-only `midpoint.analyze`. Stop on a failed gate or after that table.
+
+The six-pass trial completed on October 28. Both capture/self pairs reproduced
+the historical full logits and final hidden bytes. Both cross passes consumed
+the exact donor sequence, including all prefix positions and suffix KV history.
+
+| Midpoint source | Remaining blocks | EOS | Token 3821 | Selected token |
+|---|---|---:|---:|---|
+| Mac | Mac | 19.5 | 19.25 | EOS |
+| CUDA | CUDA | 19.375 | 19.375 | 3821 (tie) |
+| Mac | CUDA | 19.625 | 19.375 | EOS |
+| CUDA | Mac | 19.375 | 19.375 | 3821 (tie) |
+
+At this fixed prefix, the decision follows the supplied first-half states.
+This prioritizes blocks 0–13 for further investigation. Neither cross reproduces
+either native full vector, so this does not locate the earliest divergence,
+prove a defective operation or establish recovered transcription. No tokens
+were generated.
+
+Mac capture/self/cross supervised pass wall times were 39.27/41.54/39.88
+seconds, through worker exit and reaping. Sampled physical peaks were
+23.45/24.23/24.23 GiB. CUDA capture/self/cross decoder loops took
+63.55/64.45/64.31 seconds and allocated 14.08 GiB each. These loops include
+chunk observation/replay and final projection, but exclude model loading and
+final artifact handling. Timing and memory scopes differ across backends.
+Source, cleanup and production checks passed. Tethered
+transport required a separately reviewed staging repair. Failed stages were
+preserved and no accepted model pass was rerun. Evidence is under
+`/tmp/unified-coordinator-lalia-speaker-labels/midpoint-boundary-20261028`.
+
 ### Official full CUDA comparison
 
 Run the official audio frontend and generation helper to distinguish a
