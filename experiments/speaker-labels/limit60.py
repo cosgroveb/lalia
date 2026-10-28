@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
 import socket
 import subprocess
 import tarfile
@@ -241,13 +242,38 @@ def run_phase(state, phase):
         json.dump({"power": subprocess.run(["pmset", "-g", "batt"], check=True, capture_output=True, text=True).stdout,
                    "production_http_status": production_status}, marker)
     with (directory / "runner.log").open("w") as log:
-        process = subprocess.run(protocol["commands"][phase], env=environment(state), stdout=log,
-                                 stderr=subprocess.STDOUT, check=False)
+        interrupted = None
+
+        def interrupt(number, _):
+            nonlocal interrupted
+            if interrupted is None:
+                interrupted = number
+
+        handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+        try:
+            for number in handlers:
+                signal.signal(number, interrupt)
+            process = subprocess.Popen(protocol["commands"][phase], env=environment(state), stdout=log,
+                                       stderr=subprocess.STDOUT, start_new_session=True)
+            while interrupted is None:
+                try:
+                    process.wait(timeout=0.1)
+                    break
+                except subprocess.TimeoutExpired:
+                    pass
+            if interrupted is not None:
+                process.send_signal(interrupted)
+                process.wait()
+        finally:
+            for number, handler in handlers.items():
+                signal.signal(number, handler)
     cleanup = cleanup_evidence(directory)
     save(directory / "cleanup.json", cleanup)
     evaluation = {"accepted": False, "failures": [], "runner_returncode": process.returncode, "cleanup": cleanup}
     try:
         verify(protocol["hashes"])
+        if interrupted is not None:
+            raise ValueError(f"Runner interrupted by {signal.Signals(interrupted).name}")
         if process.returncode or not cleanup["complete"]:
             raise ValueError("Runner or cleanup failed")
         result_dir = directory / "results" / MODEL / CLIPS[phase]

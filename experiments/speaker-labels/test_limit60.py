@@ -1,8 +1,14 @@
 import copy
 import json
+import os
 from pathlib import Path
+import signal
 import struct
+import subprocess
+import sys
 import tempfile
+import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import wave
@@ -100,6 +106,86 @@ class TailTests(unittest.TestCase):
 
 
 class PhaseTests(unittest.TestCase):
+    def test_interruption_reaches_runner_and_waits_for_child_cleanup(self):
+        spawn, command = subprocess.Popen, subprocess.run
+        runner = """
+import os, signal, subprocess, sys, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[3])
+from run import interrupt, stop
+state = Path(sys.argv[1])
+def received(number, frame):
+    (state / "received").write_text(str(number))
+    interrupt(number, frame)
+signal.signal(signal.SIGTERM, received)
+signal.signal(signal.SIGINT, received)
+child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(5)"], start_new_session=True)
+try:
+    (state / "ready").write_text(str(child.pid))
+    if int(sys.argv[2]) == signal.SIGINT:
+        time.sleep(0.1)
+        os.kill(os.getppid(), signal.SIGINT)
+    time.sleep(2)
+except KeyboardInterrupt:
+    pass
+finally:
+    os.kill(os.getppid(), int(sys.argv[2]))
+    time.sleep(0.1)
+    stop(child)
+    (state / "reaped").write_text(str(child.returncode))
+"""
+        handlers = {number: signal.getsignal(number) for number in (signal.SIGTERM, signal.SIGINT)}
+        for number, handler in handlers.items():
+            self.addCleanup(signal.signal, number, handler)
+            signal.signal(number, lambda *_: None)
+        for number in handlers:
+            with self.subTest(signal=number), tempfile.TemporaryDirectory() as temporary:
+                state = Path(temporary)
+                phase = state / "a-control"
+                phase.mkdir()
+                protocol = {"hashes": {}, "commands": {"a-control": [sys.executable, "-c", runner,
+                            str(state), str(number), str(limit60.SOURCE)]}}
+                (state / "protocol.json").write_text(json.dumps(protocol))
+                (state / "protocol.sha256").write_text(limit60.sha256(state / "protocol.json"))
+                processes = []
+
+                def start(*args, **kwargs):
+                    process = spawn(*args, **kwargs)
+                    processes.append(process)
+                    deadline = time.monotonic() + 5
+                    while not (state / "ready").exists():
+                        if process.poll() is not None or time.monotonic() > deadline:
+                            self.fail("Synthetic runner did not become ready")
+                        time.sleep(0.01)
+                    if number == signal.SIGTERM:
+                        os.kill(os.getpid(), number)
+                    return process
+
+                def run(args, **kwargs):
+                    return SimpleNamespace(stdout="fixture power") if args[0] == "pmset" else command(args, **kwargs)
+
+                previous = {number: signal.getsignal(number) for number in handlers}
+                try:
+                    with patch.object(limit60.subprocess, "Popen", side_effect=start), \
+                            patch.object(limit60.subprocess, "run", side_effect=run), \
+                            patch.object(limit60.urllib.request, "urlopen") as urlopen, \
+                            patch.object(limit60, "cleanup_evidence", return_value={"complete": True}):
+                        urlopen.return_value.__enter__.return_value.status = 200
+                        result = limit60.run_phase(state, "a-control")
+                    self.assertTrue((state / "received").exists(), "Launcher did not forward interruption")
+                    self.assertEqual(int((state / "received").read_text()), number)
+                    self.assertEqual(int((state / "reaped").read_text()), -signal.SIGTERM)
+                    self.assertEqual(processes[0].returncode, 0)
+                    with self.assertRaises(ProcessLookupError):
+                        os.kill(int((state / "ready").read_text()), 0)
+                    self.assertFalse(result["accepted"])
+                    self.assertIn(f"Runner interrupted by {signal.Signals(number).name}", result["failures"])
+                    self.assertEqual({number: signal.getsignal(number) for number in handlers}, previous)
+                finally:
+                    for process in processes:
+                        process.terminate()
+                        process.wait(timeout=5)
+
     def test_crop_duration_matches_written_samples_at_large_offset(self):
         with tempfile.TemporaryDirectory() as directory:
             source, target = Path(directory) / "source.wav", Path(directory) / "crop.wav"

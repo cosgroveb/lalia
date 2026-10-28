@@ -18,6 +18,7 @@ import prepare_trace
 
 class TraceTests(unittest.TestCase):
     def setUp(self):
+        self.addCleanup(mx.set_default_device, mx.default_device())
         mx.set_default_device(mx.cpu)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
@@ -143,6 +144,7 @@ class TraceTests(unittest.TestCase):
 
 class WiringTests(unittest.TestCase):
     def test_model_wrapper_completes_only_after_returned_text_validation(self):
+        self.addCleanup(mx.set_default_device, mx.default_device())
         mx.set_default_device(mx.cpu)
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "trace"
