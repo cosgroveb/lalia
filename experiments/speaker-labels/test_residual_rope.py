@@ -107,7 +107,10 @@ class ResidualRoPETests(unittest.TestCase):
                 state = Path(temporary)
                 measured = baseline()
                 measured["raw_logits"]["raw_sha256"] = "bad"
-                with patch.object(probe, "frozen", side_effect=ValueError("source changed") if failure == "provenance" else None, return_value={}), patch.object(probe, "verify"), patch.object(probe, "health", return_value=200) as health, patch.object(probe, "power", return_value="power"), patch.object(probe.ReplayGuard, "check"), patch.object(probe.os, "getpriority", return_value=10), patch.object(probe, "run_arm", return_value=measured) as run:
+                with patch.object(probe, "frozen", side_effect=ValueError("source changed") if failure == "provenance" else None, return_value={}), \
+                        patch.object(probe, "verify"), patch.object(probe, "health", return_value=200) as health, \
+                        patch.object(probe, "power", return_value="power"), patch.object(probe.ReplayGuard, "check"), \
+                        patch.object(probe.os, "getpriority", return_value=10), patch.object(probe, "run_arm", return_value=measured) as run:
                     with self.assertRaises(ValueError if failure == "digest" else RuntimeError):
                         probe.execute(state)
                 self.assertEqual([call.args[1] for call in run.call_args_list], ["baseline"] if failure == "digest" else [])
@@ -128,7 +131,10 @@ class ResidualRoPETests(unittest.TestCase):
                     self.assertTrue(json.loads((state / "baseline-gate.json").read_text())["passed"])
                 return baseline()
 
-            with patch.object(probe, "frozen", return_value={}), patch.object(probe, "verify"), patch.object(probe, "health", return_value=200), patch.object(probe, "power", return_value="power"), patch.object(probe.ReplayGuard, "check"), patch.object(probe.os, "getpriority", return_value=10), patch.object(probe, "run_arm", side_effect=run):
+            with patch.object(probe, "frozen", return_value={}), patch.object(probe, "verify"), \
+                    patch.object(probe, "health", return_value=200), patch.object(probe, "power", return_value="power"), \
+                    patch.object(probe.ReplayGuard, "check"), patch.object(probe.os, "getpriority", return_value=10), \
+                    patch.object(probe, "run_arm", side_effect=run):
                 probe.execute(state)
                 original = (state / "result.json").read_bytes()
                 with self.assertRaises(FileExistsError):
@@ -162,7 +168,9 @@ while True: time.sleep(0.05)
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
             protocol = {"commands": {"baseline": [sys.executable, "-c", script]}}
-            with patch.object(probe, "frozen", return_value=protocol), patch.object(probe, "health", return_value=200), patch.object(probe, "power", return_value="power"), patch("short_windows.power", return_value="power"), patch.object(probe.os, "getpriority", return_value=10):
+            with patch.object(probe, "frozen", return_value=protocol), patch.object(probe, "health", return_value=200), \
+                    patch.object(probe, "power", return_value="power"), patch("short_windows.power", return_value="power"), \
+                    patch.object(probe.os, "getpriority", return_value=10):
                 with self.assertRaisesRegex(RuntimeError, "Interrupted"):
                     probe.execute(state)
             cleanup = json.loads((state / "cleanup.json").read_text())
@@ -177,7 +185,10 @@ while True: time.sleep(0.05)
     def test_deadline_still_attempts_cleanup_pins_and_production_health(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary)
-            with patch.object(probe, "frozen", return_value={}) as frozen, patch.object(probe, "health", return_value=200) as health, patch.object(probe, "power", return_value="power"), patch.object(probe.os, "getpriority", return_value=10), patch.object(probe.ReplayGuard, "check"), patch.object(probe, "run_arm", side_effect=TimeoutError("overall work deadline")):
+            with patch.object(probe, "frozen", return_value={}) as frozen, \
+                    patch.object(probe, "health", return_value=200) as health, patch.object(probe, "power", return_value="power"), \
+                    patch.object(probe.os, "getpriority", return_value=10), patch.object(probe.ReplayGuard, "check"), \
+                    patch.object(probe, "run_arm", side_effect=TimeoutError("overall work deadline")):
                 with self.assertRaisesRegex(TimeoutError, "overall work deadline"):
                     probe.execute(state)
             self.assertEqual(frozen.call_count, 2)

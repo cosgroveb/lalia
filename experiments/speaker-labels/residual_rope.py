@@ -411,8 +411,6 @@ def execute(state):
         failures = []
         # Reserved time keeps timeout failures subject to the same postflight checks.
         signal.alarm(0)
-        for number in (signal.SIGINT, signal.SIGTERM):
-            signal.signal(number, lambda number, _: interrupted.append(number))
         for name, seconds, action in (("cleanup", 15, guard.close),
                                       ("frozen_files", 20, lambda: frozen(state)),
                                       ("production_after", 5, health)):
@@ -425,7 +423,6 @@ def execute(state):
                 result[name] = False
             finally:
                 signal.alarm(0)
-        signal.alarm(0)
         elapsed = time.monotonic() - guard.started
         if elapsed >= 600:
             failures.append("Overall 600s bound exceeded, including postflight")
