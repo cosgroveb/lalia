@@ -46,7 +46,7 @@ import SwiftUI
         try AudioJobPreparer().prepare(session: record.id, store: store)
         try await client.prepare()
         for job in try store.read(record.id).jobs where job.state != .silence {
-            let result = try await client.transcribe(store.file(record.id, job.filename)).validated(duration: job.duration)
+            let result = try await client.transcribe(store.file(record.id, job.filename), duration: job.duration).validated(duration: job.duration)
             try store.update(record.id) { record in
                 if let index = record.jobs.firstIndex(where: { $0.id == job.id }) { record.jobs[index].response = result; record.jobs[index].state = .complete }
             }

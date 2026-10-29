@@ -71,6 +71,15 @@ struct SpeakerTranscriptTests {
         #expect(transcript.transcript.contains("Speaker 2\nYes yes."))
         #expect(SpeakerTranscript.content(.init(start: 0, end: 1, text: "[S02] spoken", speakerID: "S01")) == "[S02] spoken")
     }
+    @Test func plainTranscriptJoinsSpeechInTimeOrderAndOmitsEvents() throws {
+        let response = Transcription(text: "[1][S02]second[2][0][S01]first[1][2][S02][Music][3]",
+            segments: [.init(start: 1, end: 2, text: "[S02] second", speakerID: "S02"),
+                       .init(start: 0, end: 1, text: "[S01] first", speakerID: "S01"),
+                       .init(start: 2, end: 3, text: "[S02] [Music]", speakerID: "S02")],
+            usage: .init(type: "tokens", inputTokens: 100, outputTokens: 20, totalTokens: 120))
+        let transcript = try SpeakerTranscript(attempt: speakerAttempt(response), duration: 3)
+        #expect(transcript.plainTranscript == "first second")
+    }
     @Test func rejectsMissingExhaustedInconsistentAndImpossibleUsage() throws {
         let good = try JSONDecoder().decode(Transcription.self, from: #require(speakerAttempt().rawResponse))
         let usages: [Transcription.Usage?] = [nil,

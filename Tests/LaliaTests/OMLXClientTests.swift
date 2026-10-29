@@ -51,17 +51,30 @@ private final class HTTPFixture: URLProtocol, @unchecked Sendable {
         #expect(bytes.range(of: Data("name=\"max_tokens\"\r\n\r\n1024\r\n".utf8)) != nil)
         #expect(bytes.range(of: Data("name=\"language\"\r\n\r\nen\r\n".utf8)) != nil)
         #expect(bytes.range(of: Data("name=\"prompt\"".utf8)) == nil)
-        #expect(bytes.range(of: Data("cohere-transcribe-03-2026".utf8)) != nil)
+        #expect(bytes.range(of: Data("MOSS-Transcribe-Diarize".utf8)) != nil)
         #expect(bytes.range(of: try Data(contentsOf: audio)) != nil)
         #expect(bytes.suffix(21) == Data("\r\n--test-boundary--\r\n".utf8).suffix(21))
         #expect(try FileManager.default.attributesOfItem(atPath: body.path)[.posixPermissions] as? Int == 0o600)
     }
-    @Test func sessionConfigDefaultsAndProfileRemainIndependentOfDictation() async throws {
-        let old = #"{"baseURL":"http://127.0.0.1:8000/v1","transcriptionModel":"cohere","language":"en","summaryModel":"notes"}"#
-        let decoded = try JSONDecoder().decode(OMLXConfiguration.self, from: Data(old.utf8))
-        #expect(decoded.sessionTranscriptionModel == "MOSS-Transcribe-Diarize")
-        let missing = client(body: #"{"data":[{"id":"cohere-transcribe-03-2026"}]}"#)
-        await #expect(throws: Error.self) { try await missing.prepareSession(profile: missing.sessionProfile()) }
+    @Test func configMigratesLegacyModelsToOneCanonicalModel() throws {
+        func decode(_ json: String) throws -> OMLXConfiguration {
+            try JSONDecoder().decode(OMLXConfiguration.self, from: Data(json.utf8))
+        }
+        let both = try decode(#"{"baseURL":"http://localhost:8123/v1","transcriptionModel":"cohere-transcribe-03-2026","sessionTranscriptionModel":"legacy-moss","language":"fr","summaryModel":"notes"}"#)
+        #expect(both.transcriptionModel == "legacy-moss")
+        let cohereOnly = try decode(#"{"baseURL":"http://127.0.0.1:8000/v1","transcriptionModel":"cohere-transcribe-03-2026","language":"en","summaryModel":"notes"}"#)
+        #expect(cohereOnly.transcriptionModel == "MOSS-Transcribe-Diarize")
+        let custom = try decode(#"{"baseURL":"http://127.0.0.1:8000/v1","transcriptionModel":"custom-model","language":"en","summaryModel":"notes"}"#)
+        #expect(custom.transcriptionModel == "custom-model")
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(both)) as! [String: Any]
+        #expect(encoded["transcriptionModel"] as? String == "legacy-moss")
+        #expect(encoded["sessionTranscriptionModel"] == nil)
+        #expect(encoded["baseURL"] as? String == "http://localhost:8123/v1")
+        #expect(encoded["language"] as? String == "fr")
+        #expect(encoded["summaryModel"] as? String == "notes")
+        #expect(throws: Error.self) { try decode(#"{"baseURL":"bad","transcriptionModel":"","language":"en","summaryModel":"notes"}"#).endpoint("models") }
+    }
+    @Test func sessionProfileUsesCanonicalModel() async throws {
         let ready = client(body: #"{"data":[{"id":"MOSS-Transcribe-Diarize"}]}"#)
         let profile = try ready.sessionProfile()
         try await ready.prepareSession(profile: profile)
@@ -115,36 +128,45 @@ private final class HTTPFixture: URLProtocol, @unchecked Sendable {
                 boundary: "large", maximumBytes: 250_000_000, maximumTokens: 49_152)
         }
     }
-    @Test func decodesResponsesWithoutUsingComputeDuration() async throws {
+    @Test func dictationUsesValidatedMOSSAndProjectsPlainText() async throws {
         let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)
-        let client = client(body: #"{"text":"yes yes","duration":999,"segments":[{"start":0,"end":1,"text":"yes yes"}]}"#)
-        let result = try await client.transcribe(fixture.store.file(record.id, record.segments[0].filename))
-        #expect(result.text == "yes yes")
-        #expect(try result.validated(duration: 1).segments?.first?.end == 1)
+        let body = #"{"text":"[0][S01]नमस्ते.[0.5][0.5][S02]hello.[1][1][S01][Music][2]","segments":[{"start":0,"end":0.5,"text":"[S01] नमस्ते.","speaker_id":"S01"},{"start":0.5,"end":1,"text":"[S02] hello.","speaker_id":"S02"},{"start":1,"end":2,"text":"[S01] [Music]","speaker_id":"S01"}],"usage":{"type":"tokens","input_tokens":100,"output_tokens":20,"total_tokens":120}}"#
+        let mossClient = client(body: body)
+        let result = try await mossClient.transcribe(fixture.store.file(record.id, record.segments[0].filename), duration: 2)
+        #expect(result.text == "नमस्ते. hello.")
         let request = HTTPFixture.state.withLock { $0.request }
         #expect(request?.url?.path == "/v1/audio/transcriptions")
         #expect(request?.httpMethod == "POST")
+        var invalidUsage = try JSONSerialization.jsonObject(with: Data(body.utf8)) as! [String: Any]
+        invalidUsage.removeValue(forKey: "usage")
+        let invalid = client(body: String(decoding: try JSONSerialization.data(withJSONObject: invalidUsage), as: UTF8.self))
+        await #expect(throws: Error.self) { try await invalid.transcribe(fixture.store.file(record.id, record.segments[0].filename), duration: 2) }
+        var malformed = try JSONSerialization.jsonObject(with: Data(body.utf8)) as! [String: Any]
+        malformed["text"] = "unmatched model text"
+        let badParser = client(body: String(decoding: try JSONSerialization.data(withJSONObject: malformed), as: UTF8.self))
+        await #expect(throws: Error.self) { try await badParser.transcribe(fixture.store.file(record.id, record.segments[0].filename), duration: 2) }
     }
     @Test func reportsHTTPMalformedJSONAndMissingModels() async throws {
         let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)
         let file = try fixture.store.file(record.id, record.segments[0].filename)
         for (status, body) in [(503, "offline"), (302, "redirect"), (200, "{broken")] {
             let client = client(body: body, status: status)
-            await #expect(throws: Error.self) { try await client.transcribe(file) }
+            await #expect(throws: Error.self) { try await client.transcribe(file, duration: 1) }
         }
         let missing = client(body: #"{"data":[]}"#)
         await #expect(throws: Error.self) { try await missing.prepare() }
-        let ready = client(body: #"{"data":[{"id":"cohere-transcribe-03-2026"}]}"#)
+        let ready = client(body: #"{"data":[{"id":"MOSS-Transcribe-Diarize"}]}"#)
         try await ready.prepare()
         #expect(FileManager.default.fileExists(atPath: file.path))
     }
     @Test func keepsEmptyTextAndCancellationExplicit() async throws {
         let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)
         let file = try fixture.store.file(record.id, record.segments[0].filename)
-        let empty = client(body: #"{"text":""}"#)
-        #expect(try await empty.transcribe(file).text == "")
+        let response = #"{"text":"[0][S01][Silence][1]","segments":[{"start":0,"end":1,"text":"[S01] [Silence]","speaker_id":"S01"}],"usage":{"type":"tokens","input_tokens":100,"output_tokens":10,"total_tokens":110}}"#
+        let empty = client(body: response)
+        #expect(try await empty.transcribe(file, duration: 1).text == "")
         HTTPFixture.state.withLock { $0.suspend = true; $0.request = nil }
-        let task = Task { try await empty.transcribe(file) }
+        let task = Task { try await empty.transcribe(file, duration: 1) }
         while HTTPFixture.state.withLock({ $0.request == nil }) { await Task.yield() }
         task.cancel()
         do { _ = try await task.value; Issue.record("Cancelled HTTP upload unexpectedly succeeded.") }

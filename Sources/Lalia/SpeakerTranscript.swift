@@ -153,6 +153,7 @@ struct SpeakerTranscript: Codable, Identifiable, Sendable {
     var transcript: String {
         turns.map { "[\(SessionRecord.timestamp($0.start))–\(SessionRecord.timestamp($0.end))] \(label(for: $0))\n\($0.text)" }.joined(separator: "\n\n")
     }
+    var plainTranscript: String { turns.filter { !$0.isEvent }.map(\.text).joined(separator: " ") }
     var nextSpeakerName: String {
         var number = 1
         let names = Set(speakerNames.values)

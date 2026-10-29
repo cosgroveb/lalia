@@ -1,7 +1,7 @@
 # Lalia
 
 Native macOS menu-bar dictation and session recording. Hold Command+Shift+D
-and release to paste a local oMLX/Cohere transcript. Press Command+Shift+R to
+and release to paste a local MOSS transcript. Press Command+Shift+R to
 toggle recording of microphone and Mac audio, then add speaker labels through
 local MOSS after Stop. Recordings stop after 60 minutes.
 
@@ -23,24 +23,26 @@ Install the signed, notarized app through Homebrew:
 brew install --cask cosgroveb/tap/lalia
 ```
 
-Run oMLX locally with `cohere-transcribe-03-2026` for dictation and
-`MOSS-Transcribe-Diarize` for recordings. Cohere requires Hugging Face access.
-MOSS is public. Session analysis requires the pinned oMLX 0.7.2 / mlx-audio
-0.6.2 fork at `67408c4910edd83935f5618780e51c403ded2676`, with normal JSON token usage, explicit prompt forwarding and a
-250 MB audio upload limit.
+Run oMLX locally with `MOSS-Transcribe-Diarize` for dictation and recordings.
+The model is public. Both modes use the pinned oMLX 0.7.2 / mlx-audio 0.6.2
+fork at `67408c4910edd83935f5618780e51c403ded2676`, with JSON token usage,
+prompt forwarding and a 250 MB audio upload limit. Dictation requests cap output
+at 8,192 tokens, uploads at 20 MB, and requests at 30 minutes. Each dictation
+chunk is at most ten minutes. Dictation output contains speech text only; MOSS
+speaker labels, timestamps and sound events are omitted.
 Brian's `omlx-install-transcription` installs this compatibility patch and the
 pinned MOSS model. The installer refuses unknown runtime sources. Lalia rejects
 missing or inconsistent usage. New runtimes still require qualification.
 
 Lalia reads `~/.config/lalia/config.json`. A missing file uses these defaults.
-Older configurations can omit `sessionTranscriptionModel`. Malformed settings
-produce an error:
+Older configurations with `sessionTranscriptionModel` migrate that value to
+`transcriptionModel`; the retired Cohere identifier migrates to MOSS. Other
+custom model identifiers are preserved. Malformed settings produce an error:
 
 ```json
 {
   "baseURL": "http://127.0.0.1:8000/v1",
-  "transcriptionModel": "cohere-transcribe-03-2026",
-  "sessionTranscriptionModel": "MOSS-Transcribe-Diarize",
+  "transcriptionModel": "MOSS-Transcribe-Diarize",
   "language": "en",
   "summaryModel": "Qwen3.6-35B-A3B-oQ8-mtp"
 }
@@ -114,7 +116,7 @@ recover unfinished audio and reports files it cannot recover.
 Sessions retain separate lossless PCM CAF tracks, rotating every minute. Lalia
 aligns their offsets into one 16 kHz mono WAV for one MOSS request. It preserves
 gaps and reduces gain only when the sum would clip. Dictation keeps its ten-minute
-WAV jobs and Cohere routing. Both skip exact digital silence and preserve quiet
+WAV jobs and MOSS routing. Both skip exact digital silence and preserve quiet
 audio. Ambient noise can still produce hallucinated text. Timestamps and speaker
 assignments need review. Recovery cannot guarantee that the final partial file
 survives power loss.

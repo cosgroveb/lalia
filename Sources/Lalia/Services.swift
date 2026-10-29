@@ -3,7 +3,7 @@ import Foundation
 protocol Recording: AnyObject { func start(at file: URL) throws; func stop() throws; func close() }
 @MainActor protocol Transcribing: AnyObject {
     func prepare() async throws
-    func transcribe(_ file: URL) async throws -> Transcription
+    func transcribe(_ file: URL, duration: Double) async throws -> Transcription
     func sessionProfile() throws -> SessionTranscriptionProfile
     func prepareSession(profile: SessionTranscriptionProfile) async throws
     func transcribeSession(_ file: URL, profile: SessionTranscriptionProfile) async throws -> Data

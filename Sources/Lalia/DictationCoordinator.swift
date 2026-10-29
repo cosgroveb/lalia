@@ -306,7 +306,7 @@ import Foundation
                     if let index = record.jobs.firstIndex(where: { $0.id == job.id }) { record.jobs[index].state = .running; record.jobs[index].error = nil }
                 }
                 do {
-                    let result = try await transcriber.transcribe(store.file(id, job.filename)).validated(duration: job.duration)
+                    let result = try await transcriber.transcribe(store.file(id, job.filename), duration: job.duration).validated(duration: job.duration)
                     try Task.checkCancellation()
                     try store.update(id) { record in
                         if let index = record.jobs.firstIndex(where: { $0.id == job.id }) {

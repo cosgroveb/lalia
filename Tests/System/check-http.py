@@ -23,7 +23,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.paths.append(self.path)
         assert self.path == "/v1/models", self.path
-        self.reply({"data": [{"id": "cohere-transcribe-03-2026"}, {"id": "fixture-session"}]})
+        self.reply({"data": [{"id": "MOSS-Transcribe-Diarize"}]})
 
     def do_POST(self):
         self.server.paths.append(self.path)
@@ -34,12 +34,12 @@ class Handler(BaseHTTPRequestHandler):
         fields = {}
         for part in parts.iter_parts():
             fields[part.get_param("name", header="content-disposition")] = part.get_payload(decode=True)
-        session = fields["model"] == b"fixture-session"
-        assert fields["model"] in (b"cohere-transcribe-03-2026", b"fixture-session")
+        assert fields["model"] == b"MOSS-Transcribe-Diarize"
+        session = fields["max_tokens"] == b"49152"
         assert fields["language"] == b"en"
-        assert fields["max_tokens"] == (b"49152" if session else b"1024")
+        assert fields["max_tokens"] == (b"49152" if session else b"8192")
         assert fields["stream"] == b"false"
-        assert fields.get("prompt") == (OFFICIAL_PROMPT.encode() if session else None)
+        assert fields.get("prompt") == OFFICIAL_PROMPT.encode()
         assert len(fields["file"]) <= (250_000_000 if session else 20_000_000)
         with wave.open(io.BytesIO(fields["file"]), "rb") as audio:
             assert (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) == (16000, 1, 2)
@@ -64,7 +64,13 @@ class Handler(BaseHTTPRequestHandler):
                 del result["usage"]
             self.reply(result)
         else:
-            self.reply({"text": "fixture transcript", "duration": 99999})
+            duration = frames / 16000
+            self.reply({
+                "text": f"[0][S01]fixture transcript[{duration}]",
+                "duration": 99999,
+                "segments": [{"start": 0, "end": duration, "text": "[S01] fixture transcript", "speaker_id": "S01"}],
+                "usage": {"type": "tokens", "input_tokens": 100, "output_tokens": 20, "total_tokens": 120},
+            })
 
     def reply(self, value):
         data = json.dumps(value).encode()
@@ -95,8 +101,7 @@ def main():
                 config = root / "config.json"
                 config.write_text(json.dumps({
                     "baseURL": f"http://127.0.0.1:{server.server_port}/v1",
-                    "transcriptionModel": "cohere-transcribe-03-2026",
-                    "sessionTranscriptionModel": "fixture-session",
+                    "transcriptionModel": "MOSS-Transcribe-Diarize",
                     "language": "en", "summaryModel": "fixture-notes",
                 }))
                 command = [app, "--transcribe-file", str(fixture), "--config", str(config)]
@@ -105,6 +110,7 @@ def main():
                 assert len(server.frames) == 2, server.frames
                 assert sum(server.frames) == 610 * 16000, server.frames
                 assert result.stdout.count("fixture transcript") == 2, result.stdout
+                assert "Speaker 1" not in result.stdout, result.stdout
                 assert "Microphone (approximate)" in result.stdout
                 assert "00:10:10" in result.stdout, result.stdout
                 server.redirect = True

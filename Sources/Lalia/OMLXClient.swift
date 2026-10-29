@@ -2,24 +2,30 @@ import Foundation
 
 struct OMLXConfiguration: Codable, Sendable {
     var baseURL = "http://127.0.0.1:8000/v1"
-    var transcriptionModel = "cohere-transcribe-03-2026"
+    var transcriptionModel = "MOSS-Transcribe-Diarize"
     var language = "en"
     var summaryModel = "Qwen3.6-35B-A3B-oQ8-mtp"
-    var sessionTranscriptionModel = "MOSS-Transcribe-Diarize"
-
     enum CodingKeys: String, CodingKey { case baseURL, transcriptionModel, language, summaryModel, sessionTranscriptionModel }
-    init(baseURL: String = "http://127.0.0.1:8000/v1", transcriptionModel: String = "cohere-transcribe-03-2026",
-         language: String = "en", summaryModel: String = "Qwen3.6-35B-A3B-oQ8-mtp", sessionTranscriptionModel: String = "MOSS-Transcribe-Diarize") {
+    init(baseURL: String = "http://127.0.0.1:8000/v1", transcriptionModel: String = "MOSS-Transcribe-Diarize",
+         language: String = "en", summaryModel: String = "Qwen3.6-35B-A3B-oQ8-mtp") {
         self.baseURL = baseURL; self.transcriptionModel = transcriptionModel; self.language = language
-        self.summaryModel = summaryModel; self.sessionTranscriptionModel = sessionTranscriptionModel
+        self.summaryModel = summaryModel
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         baseURL = try values.decode(String.self, forKey: .baseURL)
-        transcriptionModel = try values.decode(String.self, forKey: .transcriptionModel)
+        let legacyModel = try values.decodeIfPresent(String.self, forKey: .sessionTranscriptionModel)
+        let configuredModel = try values.decode(String.self, forKey: .transcriptionModel)
+        transcriptionModel = legacyModel ?? (configuredModel == "cohere-transcribe-03-2026" ? "MOSS-Transcribe-Diarize" : configuredModel)
         language = try values.decode(String.self, forKey: .language)
         summaryModel = try values.decode(String.self, forKey: .summaryModel)
-        sessionTranscriptionModel = try values.decodeIfPresent(String.self, forKey: .sessionTranscriptionModel) ?? "MOSS-Transcribe-Diarize"
+    }
+    func encode(to encoder: Encoder) throws {
+        var values = encoder.container(keyedBy: CodingKeys.self)
+        try values.encode(baseURL, forKey: .baseURL)
+        try values.encode(transcriptionModel, forKey: .transcriptionModel)
+        try values.encode(language, forKey: .language)
+        try values.encode(summaryModel, forKey: .summaryModel)
     }
 
     static func load(from file: URL = FileManager.default.homeDirectoryForCurrentUser.appending(path: ".config/lalia/config.json")) throws -> Self {
@@ -37,7 +43,7 @@ struct OMLXConfiguration: Codable, Sendable {
               ["127.0.0.1", "localhost", "[::1]", "::1"].contains(parts.host?.lowercased() ?? ""),
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
               ["/v1", "/v1/"].contains(parts.path),
-              !transcriptionModel.isEmpty, !summaryModel.isEmpty, !sessionTranscriptionModel.isEmpty, !language.isEmpty else {
+              !transcriptionModel.isEmpty, !summaryModel.isEmpty, !language.isEmpty else {
             throw LaliaError("Lalia requires a loopback oMLX baseURL ending in /v1 and nonempty model/language settings.")
         }
         return url.appending(path: path)
@@ -84,7 +90,7 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
 
     func sessionProfile() throws -> SessionTranscriptionProfile {
         let config = try configuration.get()
-        let profile = SessionTranscriptionProfile(baseURL: config.baseURL, model: config.sessionTranscriptionModel, language: config.language)
+        let profile = SessionTranscriptionProfile(baseURL: config.baseURL, model: config.transcriptionModel, language: config.language)
         try profile.validate()
         return profile
     }
@@ -115,17 +121,17 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
         return data
     }
 
-    func transcribe(_ file: URL) async throws -> Transcription {
-        let config = try configuration.get()
-        let boundary = "Lalia-\(UUID().uuidString)"
-        let body = try Self.multipart(file: file, configuration: config, boundary: boundary)
-        defer { try? FileManager.default.removeItem(at: body) }
-        var request = URLRequest(url: try config.endpoint("audio/transcriptions"))
-        request.httpMethod = "POST"
-        request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-        let (data, response) = try await session.upload(for: request, fromFile: body)
-        try check(response)
-        return try JSONDecoder().decode(Transcription.self, from: data)
+    func transcribe(_ file: URL, duration: Double) async throws -> Transcription {
+        var profile = try sessionProfile()
+        profile.maximumTokens = 8_192
+        profile.maximumUploadBytes = Self.maximumUploadBytes
+        profile.timeout = 1_800
+        let raw = try await transcribeSession(file, profile: profile)
+        let response = try JSONDecoder().decode(Transcription.self, from: raw)
+        let transcript = try SpeakerTranscript(attempt: .init(profile: profile, rawResponse: raw), duration: duration)
+        return Transcription(text: transcript.plainTranscript,
+            segments: transcript.turns.filter { !$0.isEvent }.map { .init(start: $0.start, end: $0.end, text: $0.text) },
+            usage: response.usage)
     }
 
     func notes(for transcript: String) async throws -> String {

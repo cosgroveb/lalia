@@ -443,6 +443,25 @@ import Testing
             #expect(try test.storage.store.read(record.id).transcriptionComplete)
         }
     }
+    @Test func rejectedMOSSResultRetainsDictationAudioAndRetryCompletes() async throws {
+        let test = CoordinatorFixture()
+        await test.coordinator.enableDictation()
+        test.transcriber.transcriptionError = LaliaError("MOSS completion could not be verified: invalid token usage.")
+        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        await test.coordinator.waitForOperation()
+        let failed = try #require(test.coordinator.sessions.first)
+        let audio = try test.storage.store.file(failed.id, failed.segments[0].filename)
+        #expect(try test.storage.store.read(failed.id).jobs.first?.state == .failed)
+        #expect(FileManager.default.fileExists(atPath: audio.path))
+        #expect(test.injector.injected.isEmpty)
+        test.transcriber.transcriptionError = nil
+        test.coordinator.retry(failed.id)
+        await test.coordinator.waitForOperation()
+        #expect(try test.storage.store.read(failed.id).transcriptionComplete)
+        #expect(test.injector.injected.isEmpty)
+        #expect(try test.storage.store.read(failed.id).plainTranscript == "spoken text")
+        #expect(FileManager.default.fileExists(atPath: audio.path))
+    }
     @Test func preservesPasteSafeguardsAndCopy() async {
         for failure in ["empty", "permission", "paste", "none"] {
             let test = CoordinatorFixture()
@@ -685,12 +704,12 @@ private final class TestRecorder: Recording {
     var waiting = false
     private var continuation: CheckedContinuation<Void, Never>?
     func prepare() async throws { prepareCalls += 1; if let prepareError { throw prepareError } }
-    func transcribe(_: URL) async throws -> Transcription {
+    func transcribe(_ file: URL, duration: Double) async throws -> Transcription {
         transcriptionCalls += 1
         if suspend { waiting = true; await withCheckedContinuation { continuation = $0 }; waiting = false }
         if let transcriptionError { throw transcriptionError }
         if failCall == transcriptionCalls { throw TestError.failed }
-        return Transcription(text: output)
+        return Transcription(text: output, segments: [.init(start: 0, end: duration, text: output)])
     }
     func resume() { continuation?.resume(); continuation = nil }
     func sessionProfile() throws -> SessionTranscriptionProfile { profile }
