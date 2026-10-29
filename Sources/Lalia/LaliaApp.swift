@@ -114,6 +114,7 @@ private struct LaliaMenu: View {
         Button("Recording History") { coordinator.refreshHistory(); openWindow(id: "history"); NSApp.activate() }
         Button("Copy Last Transcript") { coordinator.copyLastTranscript() }.disabled(coordinator.lastTranscript == nil)
         Divider()
+        Button("About Lalia") { NSApp.orderFrontStandardAboutPanel(options: [:]); NSApp.activate() }
         Button("Quit") { NSApplication.shared.terminate(nil) }
     }
 }
