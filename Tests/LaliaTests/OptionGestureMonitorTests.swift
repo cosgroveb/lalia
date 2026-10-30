@@ -51,10 +51,10 @@ import Testing
         #expect(listener.validatePhysicalState(options: [], otherKeys: [], at: 1.1)?.availability == nil)
         #expect(listener.trackedOtherKeys.isEmpty)
 
-        _ = listener.receive(.option(.left, isDown: true, at: 2))
-        _ = listener.receive(.option(.left, isDown: false, at: 2.1))
-        _ = listener.receive(.option(.left, isDown: true, at: 2.2))
-        guard case .toggleRecording? = listener.receive(.option(.left, isDown: false, at: 2.3)).first else { Issue.record("Expected double tap after resync"); return }
+        _ = listener.receive(.option(.right, isDown: true, at: 2))
+        _ = listener.receive(.option(.right, isDown: false, at: 2.1))
+        _ = listener.receive(.option(.right, isDown: true, at: 2.2))
+        guard case .toggleRecording? = listener.receive(.option(.right, isDown: false, at: 2.3)).first else { Issue.record("Expected double tap after resync"); return }
     }
 
     @Test func idlePhysicalSnapshotIgnoresLateNativeKeyUpAndAllowsFreshHold() throws {
@@ -71,23 +71,23 @@ import Testing
         #expect(listener.validatePhysicalState(options: [], otherKeys: [], at: snapshotAt)?.availability == nil)
         #expect(listener.receive(upInput).isEmpty)
 
-        _ = listener.receive(.option(.left, isDown: true, at: snapshotAt + 0.1))
+        _ = listener.receive(.option(.right, isDown: true, at: snapshotAt + 0.1))
         guard case let .beginDictation(id)? = listener.receive(.tick(snapshotAt + 0.35)).first else { Issue.record("Expected fresh hold"); return }
-        #expect(listener.receive(.option(.left, isDown: false, at: snapshotAt + 0.4)) == [.finishDictation(id)])
+        #expect(listener.receive(.option(.right, isDown: false, at: snapshotAt + 0.4)) == [.finishDictation(id)])
     }
 
     @Test func mismatchCancelsGestureButPreservesCaptureAvailability() {
         var listener = OptionGestureListenerState()
         _ = listener.enable(options: [], otherKeys: [], at: 0)
         _ = listener.setCaptureState(available: true, active: true)
-        _ = listener.receive(.option(.left, isDown: true, at: 1))
+        _ = listener.receive(.option(.right, isDown: true, at: 1))
         guard case let .beginDictation(id)? = listener.receive(.tick(1.25)).first else { Issue.record("Expected active gesture"); return }
         let mismatch = listener.validatePhysicalState(options: [], otherKeys: [0], at: 1.3)
         #expect(mismatch?.actions == [.cancelDictation(id)])
         #expect(listener.validatePhysicalState(options: [], otherKeys: [], at: 1.4)?.availability == nil)
         #expect(listener.enabled)
         #expect(listener.receive(.otherKey(0, isDown: false, repeatEvent: false, at: 2)).isEmpty)
-        _ = listener.receive(.option(.left, isDown: true, at: 3))
+        _ = listener.receive(.option(.right, isDown: true, at: 3))
         guard case .beginDictation? = listener.receive(.tick(3.25)).first else { Issue.record("Expected gesture after rearm") ; return }
     }
 
@@ -96,10 +96,10 @@ import Testing
         _ = listener.enable(options: [], otherKeys: [], at: 0)
         _ = listener.setCaptureState(available: false, active: true)
         let inputs: [GestureInput] = [
-            .option(.left, isDown: true, at: 1),
+            .option(.right, isDown: true, at: 1),
             .otherKey(12, isDown: true, repeatEvent: false, at: 1.1),
             .otherKey(12, isDown: false, repeatEvent: false, at: 1.2),
-            .option(.left, isDown: false, at: 1.3)
+            .option(.right, isDown: false, at: 1.3)
         ]
         for input in inputs { #expect(listener.receive(input).isEmpty) }
         #expect(listener.validatePhysicalState(options: [], otherKeys: [], at: 1.1) == nil)
@@ -110,14 +110,14 @@ import Testing
         var listener = OptionGestureListenerState()
         let unavailable = listener.lose("tap creation failed")
         #expect(unavailable.availability == false)
-        #expect(listener.receive(.option(.left, isDown: true, at: 0)).isEmpty)
+        #expect(listener.receive(.option(.right, isDown: true, at: 0)).isEmpty)
 
         let enabled = listener.enable(options: [.left], otherKeys: [], at: 1)
         #expect(enabled.availability == true)
         _ = listener.receive(.option(.right, isDown: true, at: 1.1))
         #expect(listener.receive(.tick(1.35)).isEmpty)
-        _ = listener.receive(.option(.left, isDown: false, at: 1.4))
-        _ = listener.receive(.option(.right, isDown: false, at: 1.5))
+        _ = listener.receive(.option(.right, isDown: false, at: 1.4))
+        _ = listener.receive(.option(.left, isDown: false, at: 1.5))
         _ = listener.receive(.option(.right, isDown: true, at: 1.6))
         guard case .beginDictation(_)? = listener.receive(.tick(1.85)).first else { Issue.record("Expected action after all-up rearm"); return }
     }
@@ -126,12 +126,12 @@ import Testing
         for reason in ["Input Monitoring permission is unavailable.", "Secure Event Input is active.", "sleep/wake", "physical state mismatch", "tap disabled"] {
             var listener = OptionGestureListenerState()
             _ = listener.enable(options: [], otherKeys: [], at: 0)
-            _ = listener.receive(.option(.left, isDown: true, at: 1))
+            _ = listener.receive(.option(.right, isDown: true, at: 1))
             guard case let .beginDictation(id)? = listener.receive(.tick(1.25)).first else { Issue.record("Expected active capture"); return }
             let lost = listener.lose(reason)
             #expect(lost.availability == false)
             #expect(lost.actions == [.cancelDictation(id)])
-            #expect(listener.receive(.option(.left, isDown: false, at: 1.3)).isEmpty)
+            #expect(listener.receive(.option(.right, isDown: false, at: 1.3)).isEmpty)
         }
     }
 
@@ -151,15 +151,15 @@ import Testing
         #expect(prelatchedInput == [.option(.left, isDown: true, at: 3)])
         var prelatchedRecognizer = OptionGestureRecognizer()
         for input in prelatchedInput { _ = prelatchedRecognizer.consume(input) }
-        #expect(prelatchedRecognizer.consume(.tick(3.25)).count == 1)
+        #expect(prelatchedRecognizer.consume(.tick(3.25)).isEmpty)
         var recognizer = OptionGestureRecognizer()
-        for input in inputs { _ = recognizer.consume(input) }
+        for input in OptionGestureMonitor.normalizedInputs(for: rightDown, type: .flagsChanged, at: 1) { _ = recognizer.consume(input) }
         guard case let .beginDictation(id)? = recognizer.consume(.tick(1.25)).first else { Issue.record("Expected hold action"); return }
 
         let rightUp = try keyboardEvent(kVK_RightOption, flags: 0)
         #expect(OptionGestureMonitor.normalizedInputs(for: rightUp, type: .flagsChanged, at: 1.3) == [.option(.right, isDown: false, at: 1.3)])
         let leftUp = try keyboardEvent(kVK_Option, flags: 0)
-        for input in OptionGestureMonitor.normalizedInputs(for: leftUp, type: .flagsChanged, at: 1.4) { #expect(recognizer.consume(input) == [.finishDictation(id)]) }
+        for input in OptionGestureMonitor.normalizedInputs(for: rightUp, type: .flagsChanged, at: 1.4) { #expect(recognizer.consume(input) == [.finishDictation(id)]) }
     }
 
     @Test func physicalOptionSnapshotMatchesDeviceFlagsAndRightOptionEvent() throws {
@@ -212,7 +212,7 @@ import Testing
         #expect(OptionGestureMonitor.normalizedInputs(for: mouse, type: .rightMouseUp, at: 2) == [.mouse(button: 257, isDown: false, at: 2)])
         #expect(OptionGestureMonitor.normalizedInputs(for: mouse, type: .scrollWheel, at: 3) == [.mouse(button: nil, isDown: true, at: 3), .mouse(button: nil, isDown: false, at: 3)])
 
-        let option = try keyboardEvent(kVK_Option, flags: UInt64(NX_DEVICELALTKEYMASK))
+        let option = try keyboardEvent(kVK_RightOption, flags: UInt64(NX_DEVICERALTKEYMASK))
         var recognizer = OptionGestureRecognizer()
         _ = recognizer.consume(OptionGestureMonitor.normalizedInputs(for: option, type: .flagsChanged, at: 1)[0])
         guard case let .beginDictation(id)? = recognizer.consume(.tick(1.25)).first else { Issue.record("Expected hold action"); return }
@@ -251,12 +251,12 @@ import Testing
         var listener = OptionGestureListenerState()
         _ = listener.enable(options: [], otherKeys: [], at: 0)
         _ = listener.setCaptureState(available: true, active: true)
-        _ = listener.receive(.option(.left, isDown: true, at: 1))
+        _ = listener.receive(.option(.right, isDown: true, at: 1))
         let begin = listener.receive(.tick(1.25))
         queue.send(begin)
         await drainMainQueue()
         guard case let .beginDictation(id)? = begin.first else { Issue.record("Expected begin"); return }
-        let finish = listener.receive(.option(.left, isDown: false, at: 1.3))
+        let finish = listener.receive(.option(.right, isDown: false, at: 1.3))
         queue.send(finish)
         let mismatch = listener.validatePhysicalState(options: [], otherKeys: [0], at: 1.4)
         #expect(mismatch?.actions.isEmpty == true)

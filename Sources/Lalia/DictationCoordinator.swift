@@ -40,7 +40,7 @@ import Foundation
     let recordingLimit: Double
     private let warningSeconds: Double
     var onCaptureAvailabilityChanged: (@MainActor (Bool, Bool) -> Void)? { didSet { notifyCaptureAvailability() } }
-    private var readyMessage: String { gestureAvailable ? "Ready. Hold either Option key to dictate." : "Dictation is ready. Enable Gestures to use Option keys." }
+    private var readyMessage: String { gestureAvailable ? "Ready. Hold Right Option to dictate." : "Dictation is ready. Enable Gestures to use Right Option." }
     private var canBeginGestureCapture: Bool {
         gestureAvailable && phase == .idle && authorizer.currentStatus().microphoneGranted && !quitting
     }

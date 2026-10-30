@@ -104,7 +104,7 @@ struct OptionGestureRecognizer {
             if down {
                 if options.contains(side) { return [] }
                 options.insert(side)
-                guard options.count == 1, otherKeys.isEmpty, available else { return invalidate(blocked: true) }
+                guard side == .right, options.count == 1, otherKeys.isEmpty, available else { return invalidate(blocked: true) }
                 switch state {
                 case let .awaitSecond(previous, released) where previous == side && at - released <= Self.doubleTapGap + 1e-9:
                     let id = UUID(); state = .secondPressed(side, at, id); return []

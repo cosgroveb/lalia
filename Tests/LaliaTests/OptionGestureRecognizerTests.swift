@@ -4,10 +4,34 @@ import Testing
 struct OptionGestureRecognizerTests {
     @Test func holdBeginsAndReleaseFinishesWithSameIdentity() {
         var recognizer = OptionGestureRecognizer()
-        #expect(recognizer.consume(.option(.left, isDown: true, at: 0)).isEmpty)
+        #expect(recognizer.consume(.option(.right, isDown: true, at: 0)).isEmpty)
         let begin = recognizer.consume(.tick(0.250))
         guard case let .beginDictation(id) = begin.first else { Issue.record("Expected begin action"); return }
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.4)) == [.finishDictation(id)])
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.4)) == [.finishDictation(id)])
+    }
+
+    @Test func leftOptionNeverStartsHoldOrDoubleTap() {
+        var recognizer = OptionGestureRecognizer()
+        _ = recognizer.consume(.option(.left, isDown: true, at: 0))
+        #expect(recognizer.trackedOptions == [.left])
+        #expect(recognizer.consume(.tick(0.250)).isEmpty)
+        _ = recognizer.consume(.option(.left, isDown: false, at: 0.3))
+        _ = recognizer.consume(.option(.left, isDown: true, at: 0.4))
+        _ = recognizer.consume(.option(.left, isDown: false, at: 0.5))
+        _ = recognizer.consume(.option(.left, isDown: true, at: 0.6))
+        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.7)).isEmpty)
+    }
+
+    @Test func leftOptionChordCancelsRightHoldAndBlocksRightDoubleTap() {
+        var recognizer = OptionGestureRecognizer()
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0))
+        guard case let .beginDictation(id)? = recognizer.consume(.tick(0.250)).first else { Issue.record("Expected hold action"); return }
+        #expect(recognizer.consume(.option(.left, isDown: true, at: 0.3)) == [.cancelDictation(id)])
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.4)).isEmpty)
+        #expect(recognizer.trackedOptions == [.left])
+        _ = recognizer.consume(.option(.left, isDown: false, at: 0.5))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.6))
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.7)).isEmpty)
     }
 
     @Test func sameSideDoubleTapTogglesOnlyOnSecondRelease() {
@@ -20,48 +44,48 @@ struct OptionGestureRecognizerTests {
 
     @Test func oppositeSidesNeverCompleteDoubleTapAndChordCancelsHold() {
         var recognizer = OptionGestureRecognizer()
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0))
-        _ = recognizer.consume(.option(.left, isDown: false, at: 0.1))
-        _ = recognizer.consume(.option(.right, isDown: true, at: 0.2))
-        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.3)).isEmpty)
-        _ = recognizer.consume(.option(.left, isDown: true, at: 1))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0))
+        _ = recognizer.consume(.option(.right, isDown: false, at: 0.1))
+        _ = recognizer.consume(.option(.left, isDown: true, at: 0.2))
+        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.3)).isEmpty)
+        _ = recognizer.consume(.option(.right, isDown: true, at: 1))
         let action = recognizer.consume(.tick(1.25))
         guard case let .beginDictation(id) = action.first else { Issue.record("Expected begin action"); return }
         #expect(recognizer.consume(.otherKey(8, isDown: true, repeatEvent: false, at: 1.3)) == [.cancelDictation(id)])
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 1.4)).isEmpty)
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 1.4)).isEmpty)
     }
 
     @Test func exactBoundariesAreInclusiveAndBlockedRequiresAllUp() {
         var recognizer = OptionGestureRecognizer()
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0))
-        _ = recognizer.consume(.option(.left, isDown: false, at: 0.1))
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0.4))
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.65)).isEmpty)
-        _ = recognizer.consume(.option(.left, isDown: true, at: 1))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0))
+        _ = recognizer.consume(.option(.right, isDown: false, at: 0.1))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.4))
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.65)).isEmpty)
+        _ = recognizer.consume(.option(.right, isDown: true, at: 1))
         _ = recognizer.consume(.otherKey(4, isDown: true, repeatEvent: false, at: 1.1))
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 1.2)).isEmpty)
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 1.2)).isEmpty)
         _ = recognizer.consume(.otherKey(4, isDown: false, repeatEvent: false, at: 1.3))
-        #expect(recognizer.consume(.option(.left, isDown: true, at: 1.4)).isEmpty)
+        #expect(recognizer.consume(.option(.right, isDown: true, at: 1.4)).isEmpty)
     }
 
     @Test func exactHoldThresholdWinsOverTap() {
         var recognizer = OptionGestureRecognizer()
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0))
         guard case let .beginDictation(id)? = recognizer.consume(.tick(0.250)).first else { Issue.record("Expected hold action"); return }
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.250)) == [.finishDictation(id)])
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.250)) == [.finishDictation(id)])
     }
 
     @Test func slowTripleAndRepeatedTapsDoNotToggleAgain() {
         var recognizer = OptionGestureRecognizer()
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0))
-        _ = recognizer.consume(.option(.left, isDown: false, at: 0.1))
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0.5))
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.6)).isEmpty)
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0.8))
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0.85))
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.9)).count == 1)
-        _ = recognizer.consume(.option(.left, isDown: true, at: 1.1))
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 1.2)).isEmpty)
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0))
+        _ = recognizer.consume(.option(.right, isDown: false, at: 0.1))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.5))
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.6)).isEmpty)
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.8))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.85))
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.9)).count == 1)
+        _ = recognizer.consume(.option(.right, isDown: true, at: 1.1))
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 1.2)).isEmpty)
     }
 
     @Test func preheldKeysAndAvailabilityLossRequireAllUp() {
@@ -79,24 +103,24 @@ struct OptionGestureRecognizerTests {
 
     @Test func resetCancelsHeldCaptureAndOutOfOrderInputBlocks() {
         var recognizer = OptionGestureRecognizer()
-        _ = recognizer.consume(.option(.left, isDown: true, at: 1))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 1))
         guard case let .beginDictation(id)? = recognizer.consume(.tick(1.25)).first else { Issue.record("Expected begin action"); return }
         #expect(recognizer.consume(.reset) == [.cancelDictation(id)])
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.9)).isEmpty)
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.9)).isEmpty)
     }
 
     @Test func captureReadinessChangeInvalidatesCandidateButLeavesSessionToggleAvailable() {
         var recognizer = OptionGestureRecognizer()
         _ = recognizer.consume(.captureAvailability(true))
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0))
-        _ = recognizer.consume(.option(.left, isDown: false, at: 0.1))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0))
+        _ = recognizer.consume(.option(.right, isDown: false, at: 0.1))
         _ = recognizer.consume(.captureAvailability(false))
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0.2))
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.3)).isEmpty)
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0.4))
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.5)).count == 1)
-        _ = recognizer.consume(.option(.left, isDown: true, at: 0.6))
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.2))
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.3)).isEmpty)
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.4))
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.5)).count == 1)
+        _ = recognizer.consume(.option(.right, isDown: true, at: 0.6))
         #expect(recognizer.consume(.tick(0.85)).isEmpty)
-        #expect(recognizer.consume(.option(.left, isDown: false, at: 0.9)).isEmpty)
+        #expect(recognizer.consume(.option(.right, isDown: false, at: 0.9)).isEmpty)
     }
 }

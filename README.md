@@ -1,8 +1,8 @@
 # Lalia
 
-Native macOS menu-bar dictation and session recording. Hold either Option key
+Native macOS menu-bar dictation and session recording. Hold Right Option
 to record dictation, then release to paste a local MOSS transcript. Double-tap
-the same Option key to start or stop recording microphone and Mac audio, then
+Right Option to start or stop recording microphone and Mac audio, then
 add speaker labels through local MOSS after Stop. Recordings stop after 60 minutes.
 
 Speaker labels remain experimental. Both tested hour-long recordings completed,
@@ -64,12 +64,12 @@ usage fails analysis rather than accepting an incomplete response.
 
 ## Use
 
-Choose `Enable Dictation` and `Enable Gestures`, focus a text field, hold either
-Option key, speak after Recording appears, then release. `Copy Last Transcript`
+Choose `Enable Dictation` and `Enable Gestures`, focus a text field, hold
+Right Option, speak after Recording appears, then release. `Copy Last Transcript`
 remains available if pasting fails. Option-letter, modifier, mouse and scroll
 chords cancel capture without transcription or paste; cancelled audio remains
 available in History for explicit retry or deletion.
-Holding for 250 ms starts dictation. A same-side second press within 300 ms
+Holding Right Option for 250 ms starts dictation. A second press within 300 ms
 toggles session recording when released before the hold threshold.
 
 If Input Monitoring is lost, Secure Event Input starts, or the Mac sleeps,
@@ -79,7 +79,7 @@ listener; gestures rearm only after all keys are released. Clipboard restoration
 covers eagerly readable pasteboard data. macOS does not expose every lazy or
 promised representation.
 
-Double-tap the same Option key to start recording microphone and Mac audio,
+Double-tap Right Option to start recording microphone and Mac audio,
 then double-tap it again to stop, save, and transcribe. The menu and history
 window offer the same `Start Recording` / `Stop Recording` button. Recording
 continues when you release the key. Lalia shows elapsed and remaining time,

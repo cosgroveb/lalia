@@ -159,6 +159,6 @@ struct RecordingButton: View {
             coordinator.toggleRecording()
         }
         .disabled(coordinator.phase != .recordingSession && (!coordinator.available || !coordinator.gestureAvailable))
-        .help("Hold either Option key twice to start or stop recording microphone and Mac audio for up to 60 minutes.")
+        .help("Double-tap Right Option to start or stop recording microphone and Mac audio for up to 60 minutes.")
     }
 }
