@@ -162,6 +162,21 @@ import Testing
         for input in OptionGestureMonitor.normalizedInputs(for: leftUp, type: .flagsChanged, at: 1.4) { #expect(recognizer.consume(input) == [.finishDictation(id)]) }
     }
 
+    @Test func physicalOptionSnapshotMatchesDeviceFlagsAndRightOptionEvent() throws {
+        let cases: [(UInt64, Set<OptionSide>)] = [
+            (UInt64(NX_DEVICERALTKEYMASK), [.right]),
+            (UInt64(NX_DEVICELALTKEYMASK) | UInt64(NX_DEVICERALTKEYMASK), [.left, .right]),
+            (0, [])
+        ]
+        for (flags, expectedSides) in cases {
+            #expect(OptionGestureMonitor.optionSides(in: flags) == expectedSides)
+            let rightEvent = try keyboardEvent(kVK_RightOption, flags: flags)
+            #expect(OptionGestureMonitor.normalizedInputs(for: rightEvent, type: .flagsChanged, at: 1) == [
+                .option(.right, isDown: expectedSides.contains(.right), at: 1)
+            ])
+        }
+    }
+
     @Test func normalizesModifierFamiliesNormalKeysAndRepeats() throws {
         let families: [(Int, Int?, CGEventFlags, UInt16)] = [
             (kVK_Shift, kVK_RightShift, .maskShift, 240),

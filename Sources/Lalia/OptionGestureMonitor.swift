@@ -104,8 +104,8 @@ struct OptionGestureListenerState {
         switch type {
         case .flagsChanged:
             let code = UInt16(event.getIntegerValueField(.keyboardEventKeycode))
-            if code == UInt16(kVK_Option) { return [.option(.left, isDown: event.flags.rawValue & leftOptionDeviceMask != 0, at: at)] }
-            if code == UInt16(kVK_RightOption) { return [.option(.right, isDown: event.flags.rawValue & rightOptionDeviceMask != 0, at: at)] }
+            if code == UInt16(kVK_Option) { return [.option(.left, isDown: optionSides(in: event.flags.rawValue).contains(.left), at: at)] }
+            if code == UInt16(kVK_RightOption) { return [.option(.right, isDown: optionSides(in: event.flags.rawValue).contains(.right), at: at)] }
             if code == UInt16(kVK_CapsLock) {
                 return [.otherKey(code, isDown: true, repeatEvent: false, at: at), .otherKey(code, isDown: false, repeatEvent: false, at: at)]
             }
@@ -126,6 +126,13 @@ struct OptionGestureListenerState {
             return [.mouse(button: nil, isDown: true, at: at), .mouse(button: nil, isDown: false, at: at)]
         default: return []
         }
+    }
+
+    static func optionSides(in flags: UInt64) -> Set<OptionSide> {
+        var sides = Set<OptionSide>()
+        if flags & leftOptionDeviceMask != 0 { sides.insert(.left) }
+        if flags & rightOptionDeviceMask != 0 { sides.insert(.right) }
+        return sides
     }
 
     func start(requestPermission: Bool = false) {
@@ -207,9 +214,7 @@ struct OptionGestureListenerState {
     }
 
     private func physicalState() -> (options: Set<OptionSide>, keys: Set<UInt16>) {
-        var heldOptions = Set<OptionSide>()
-        if keyDown(Int64(kVK_Option)) { heldOptions.insert(.left) }
-        if keyDown(Int64(kVK_RightOption)) { heldOptions.insert(.right) }
+        let heldOptions = Self.optionSides(in: CGEventSource.flagsState(.combinedSessionState).rawValue)
         var heldKeys = physicalOtherKeys()
         heldKeys.formUnion((0..<5).compactMap { index in
             guard let button = CGMouseButton(rawValue: UInt32(index)), CGEventSource.buttonState(.combinedSessionState, button: button) else { return nil }
