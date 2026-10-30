@@ -158,7 +158,6 @@ import Testing
 
         let rightUp = try keyboardEvent(kVK_RightOption, flags: 0)
         #expect(OptionGestureMonitor.normalizedInputs(for: rightUp, type: .flagsChanged, at: 1.3) == [.option(.right, isDown: false, at: 1.3)])
-        let leftUp = try keyboardEvent(kVK_Option, flags: 0)
         for input in OptionGestureMonitor.normalizedInputs(for: rightUp, type: .flagsChanged, at: 1.4) { #expect(recognizer.consume(input) == [.finishDictation(id)]) }
     }
 
