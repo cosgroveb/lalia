@@ -46,7 +46,7 @@ struct OptionGestureListenerState {
     }
 
     mutating func receive(_ input: GestureInput) -> [GestureAction] {
-        guard enabled, physicalStateTime.map({ input.timestamp >= $0 }) ?? true else { return [] }
+        guard enabled, physicalStateTime.map({ (input.timestamp ?? -.infinity) >= $0 }) ?? true else { return [] }
         return recognizer.consume(input)
     }
 
@@ -61,15 +61,6 @@ struct OptionGestureListenerState {
         let actions = recognizer.consume(.reset) + recognizer.consume(.seed(options: options, otherKeys: otherKeys, at: at))
         physicalStateTime = at
         return OptionGestureListenerTransition(actions: actions)
-    }
-}
-
-private extension GestureInput {
-    var timestamp: TimeInterval {
-        switch self {
-        case let .option(_, _, at), let .otherKey(_, _, _, at), let .mouse(_, _, at), let .tick(at), let .seed(_, _, at): at
-        case .reset, .availability, .captureAvailability: -.infinity
-        }
     }
 }
 

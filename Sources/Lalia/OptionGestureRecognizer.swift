@@ -11,6 +11,13 @@ enum GestureInput: Equatable {
     case availability(Bool)
     case captureAvailability(Bool)
     case seed(options: Set<OptionSide>, otherKeys: Set<UInt16>, at: TimeInterval)
+
+    var timestamp: TimeInterval? {
+        switch self {
+        case let .option(_, _, at), let .otherKey(_, _, _, at), let .mouse(_, _, at), let .tick(at), let .seed(_, _, at): at
+        case .reset, .availability, .captureAvailability: nil
+        }
+    }
 }
 
 enum GestureAction: Equatable {
@@ -57,11 +64,7 @@ struct OptionGestureRecognizer {
     }
 
     mutating func consume(_ input: GestureInput) -> [GestureAction] {
-        let timestamp: TimeInterval
-        switch input {
-        case let .option(_, _, at), let .otherKey(_, _, _, at), let .mouse(_, _, at), let .tick(at), let .seed(_, _, at): timestamp = at
-        case .reset, .availability, .captureAvailability: timestamp = lastTime
-        }
+        let timestamp = input.timestamp ?? lastTime
         if timestamp < lastTime {
             return reset(blocked: true)
         }
