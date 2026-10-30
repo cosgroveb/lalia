@@ -90,7 +90,9 @@ struct LaliaApp: App {
             }
         }
         gestures.onAvailability = { available, message in coordinator.setGestureAvailability(available, message: message) }
-        coordinator.onCaptureAvailabilityChanged = { gestures.setCaptureAvailable($0) }
+        coordinator.onCaptureAvailabilityChanged = { available, active in
+            gestures.setCaptureState(available: available, active: active)
+        }
         coordinator.startupRefresh()
         gestures.start()
         delegate.coordinator = coordinator

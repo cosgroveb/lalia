@@ -500,6 +500,23 @@ import Testing
         #expect(try test.storage.store.history().records[0].segments[0].complete)
         #expect(test.transcriber.prepareCalls == 0)
     }
+    @Test func captureAvailabilityReportsSessionLifecycleToGestureMonitor() async {
+        let test = CoordinatorFixture()
+        var activeStates: [Bool] = []
+        test.coordinator.onCaptureAvailabilityChanged = { _, active in activeStates.append(active) }
+
+        test.coordinator.startSession()
+        #expect(activeStates.last == true)
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.phase == .recordingSession)
+        #expect(activeStates.last == true)
+
+        test.coordinator.stopSession()
+        #expect(activeStates.last == true)
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.phase == .idle)
+        #expect(activeStates.last == false)
+    }
     @Test func recordingToggleSavesTranscribesAndStartsANewSession() async throws {
         let test = CoordinatorFixture()
         test.authorizer.status = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: false)

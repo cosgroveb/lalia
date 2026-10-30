@@ -39,7 +39,7 @@ import Foundation
     private var deadline: Task<Void, Never>?
     let recordingLimit: Double
     private let warningSeconds: Double
-    var onCaptureAvailabilityChanged: (@MainActor (Bool) -> Void)? { didSet { notifyCaptureAvailability() } }
+    var onCaptureAvailabilityChanged: (@MainActor (Bool, Bool) -> Void)? { didSet { notifyCaptureAvailability() } }
     private var readyMessage: String { gestureAvailable ? "Ready. Hold either Option key to dictate." : "Dictation is ready. Enable Gestures to use Option keys." }
     private var canBeginGestureCapture: Bool {
         gestureAvailable && phase == .idle && authorizer.currentStatus().microphoneGranted && !quitting
@@ -48,7 +48,10 @@ import Foundation
     var available: Bool { !quitting && (phase == .idle || phase == .needsPermission) }
     var canCancel: Bool { currentJob != nil }
     func canProcess(_ id: UUID) -> Bool { !quitting && id != activeSession && processing[id] == nil }
-    private func notifyCaptureAvailability() { onCaptureAvailabilityChanged?(canBeginGestureCapture) }
+    private func notifyCaptureAvailability() {
+        let captureActive = phase == .preparing || phase == .recording || phase == .recordingSession || phase == .stopping
+        onCaptureAvailabilityChanged?(canBeginGestureCapture, captureActive)
+    }
 
     init(recorder: Recording, transcriber: Transcribing, injector: Injecting, authorizer: Authorizing,
          store: SessionStore = SessionStore(), capture: SessionCapturing = SessionCapture(),

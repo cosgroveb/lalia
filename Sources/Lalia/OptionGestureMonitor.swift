@@ -22,6 +22,8 @@ struct OptionGestureListenerState {
     private var recognizer = OptionGestureRecognizer()
     private(set) var enabled = false
     var hasPendingGesture: Bool { recognizer.hasPendingGesture }
+    private(set) var captureActive = false
+    private var needsPhysicalStateCheck: Bool { hasPendingGesture || captureActive }
     var holdDeadline: TimeInterval? { recognizer.holdDeadline }
     var trackedOptions: Set<OptionSide> { recognizer.trackedOptions }
     var trackedOtherKeys: Set<UInt16> { recognizer.trackedOtherKeys }
@@ -44,8 +46,15 @@ struct OptionGestureListenerState {
         return recognizer.consume(input)
     }
 
-    mutating func setCaptureAvailable(_ available: Bool) -> [GestureAction] {
-        recognizer.consume(.captureAvailability(available))
+    mutating func setCaptureState(available: Bool, active: Bool) -> [GestureAction] {
+        captureActive = active
+        return recognizer.consume(.captureAvailability(available))
+    }
+
+    mutating func validatePhysicalState(options: Set<OptionSide>, otherKeys: Set<UInt16>) -> OptionGestureListenerTransition? {
+        guard needsPhysicalStateCheck,
+              options != trackedOptions || otherKeys != trackedOtherKeys else { return nil }
+        return lose("Keyboard state changed without a matching event. Choose Enable Gestures to resume.")
     }
 }
 
@@ -151,8 +160,8 @@ struct OptionGestureListenerState {
         apply(listener.lose("Gesture listening stopped."))
     }
 
-    func setCaptureAvailable(_ available: Bool) {
-        dispatch(listener.setCaptureAvailable(available))
+    func setCaptureState(available: Bool, active: Bool) {
+        dispatch(listener.setCaptureState(available: available, active: active))
         scheduleHoldTimer()
     }
 
@@ -203,18 +212,9 @@ struct OptionGestureListenerState {
         if let failure = Self.healthFailure(permission: CGPreflightListenEventAccess(), secureInput: IsSecureEventInputEnabled(), tapEnabled: CGEvent.tapIsEnabled(tap: tap)) {
             loseListener("\(failure) Choose Enable Gestures to retry."); return
         }
-        guard listener.hasPendingGesture else { return }
-        let physicalOptions = Set([
-            keyDown(Int64(kVK_Option)) ? OptionSide.left : nil,
-            keyDown(Int64(kVK_RightOption)) ? OptionSide.right : nil
-        ].compactMap { $0 })
-        var physicalKeys = physicalOtherKeys()
-        physicalKeys.formUnion((0..<5).compactMap { index in
-            guard let button = CGMouseButton(rawValue: UInt32(index)), CGEventSource.buttonState(.combinedSessionState, button: button) else { return nil }
-            return UInt16(256 + index)
-        })
-        if physicalOptions != listener.trackedOptions || physicalKeys != listener.trackedOtherKeys {
-            loseListener("Keyboard state changed without a matching event. Choose Enable Gestures to resume.")
+        let actual = physicalState()
+        if let transition = listener.validatePhysicalState(options: actual.options, otherKeys: actual.keys) {
+            handleListenerLoss(transition)
         }
     }
 
@@ -271,10 +271,14 @@ struct OptionGestureListenerState {
 
     private func loseListener(_ message: String) {
         guard enabled || lastHealthy else { return }
+        handleListenerLoss(listener.lose(message))
+    }
+
+    private func handleListenerLoss(_ transition: OptionGestureListenerTransition) {
         actionDelivery.invalidate()
         tearDown()
         lastHealthy = false
-        apply(listener.lose(message))
+        apply(transition)
     }
 
     private func setAvailable(_ value: Bool, _ message: String?) {

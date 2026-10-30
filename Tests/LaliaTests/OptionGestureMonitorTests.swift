@@ -19,6 +19,32 @@ import Testing
         #expect(OptionGestureMonitor.healthFailure(permission: true, secureInput: false, tapEnabled: true) == nil)
     }
 
+    @Test func watchdogChecksPhysicalStateDuringCaptureButNotIdle() {
+        var listener = OptionGestureListenerState()
+        _ = listener.enable(options: [], otherKeys: [], at: 0)
+        #expect(listener.validatePhysicalState(options: [.left], otherKeys: []) == nil)
+
+        _ = listener.setCaptureState(available: false, active: true)
+        let mismatch = listener.validatePhysicalState(options: [.left], otherKeys: [])
+        #expect(mismatch?.availability == false)
+        #expect(listener.validatePhysicalState(options: [], otherKeys: []) == nil)
+    }
+
+    @Test func ordinaryTypingAndOptionChordDoNotStopActiveSession() {
+        var listener = OptionGestureListenerState()
+        _ = listener.enable(options: [], otherKeys: [], at: 0)
+        _ = listener.setCaptureState(available: false, active: true)
+        let inputs: [GestureInput] = [
+            .option(.left, isDown: true, at: 1),
+            .otherKey(12, isDown: true, repeatEvent: false, at: 1.1),
+            .otherKey(12, isDown: false, repeatEvent: false, at: 1.2),
+            .option(.left, isDown: false, at: 1.3)
+        ]
+        for input in inputs { #expect(listener.receive(input).isEmpty) }
+        #expect(listener.validatePhysicalState(options: [], otherKeys: []) == nil)
+        #expect(listener.enabled)
+    }
+
     @Test func listenerFailureDisablesActionsAndRequiresExplicitEnableAndAllUp() {
         var listener = OptionGestureListenerState()
         let unavailable = listener.lose("tap creation failed")
