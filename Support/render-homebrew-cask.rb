@@ -25,8 +25,8 @@ File.write(output, <<~CASK)
     end
 
     depends_on arch: :arm64
-    depends_on macos: :tahoe
     depends_on formula: "cosgroveb/tap/lalia-runtime"
+    depends_on macos: :tahoe
 
     app "Lalia.app"
   end
