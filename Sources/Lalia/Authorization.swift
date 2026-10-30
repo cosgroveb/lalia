@@ -6,7 +6,8 @@ import Foundation
     func currentStatus() -> AuthorizationStatus {
         AuthorizationStatus(
             microphoneGranted: AVAudioApplication.shared.recordPermission == .granted,
-            accessibilityGranted: AXIsProcessTrusted()
+            accessibilityGranted: AXIsProcessTrusted(),
+            listeningAccessGranted: CGPreflightListenEventAccess()
         )
     }
     func requestMicrophone() async -> Bool {
@@ -18,4 +19,5 @@ import Foundation
         if !AXIsProcessTrusted() { AXIsProcessTrustedWithOptions(["AXTrustedCheckOptionPrompt": true] as CFDictionary) }
         return currentStatus()
     }
+    func requestListeningAccess() async -> Bool { CGRequestListenEventAccess(); return CGPreflightListenEventAccess() }
 }

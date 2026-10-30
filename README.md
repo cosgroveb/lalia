@@ -1,9 +1,9 @@
 # Lalia
 
-Native macOS menu-bar dictation and session recording. Hold Command+Shift+D
-and release to paste a local MOSS transcript. Press Command+Shift+R to
-toggle recording of microphone and Mac audio, then add speaker labels through
-local MOSS after Stop. Recordings stop after 60 minutes.
+Native macOS menu-bar dictation and session recording. Hold either Option key
+to record dictation, then release to paste a local MOSS transcript. Double-tap
+the same Option key to start or stop recording microphone and Mac audio, then
+add speaker labels through local MOSS after Stop. Recordings stop after 60 minutes.
 
 Speaker labels remain experimental. Both tested hour-long recordings completed,
 but MOSS can omit speech or add incorrect text and speaker labels. Review the
@@ -11,9 +11,10 @@ transcript against the saved audio. Failed analysis retains audio and the
 previous transcript for retry. The 60-minute capture limit does not guarantee
 transcription accuracy.
 
-Requires Apple silicon and macOS 26 or newer. Dictation needs Microphone and
-Accessibility permission. Sessions need Microphone and Screen & System Audio
-Recording permission. Accessibility is only for pasting.
+Requires Apple silicon and macOS 26 or newer. Gestures need Input Monitoring.
+Dictation needs Microphone and Accessibility permission. Sessions need
+Microphone and Screen & System Audio Recording permission. Accessibility is
+only for pasting.
 
 ## Install and configure
 
@@ -63,18 +64,28 @@ usage fails analysis rather than accepting an incomplete response.
 
 ## Use
 
-Choose `Enable Dictation`, focus a text field, hold Command+Shift+D, speak,
-and release. `Copy Last Transcript` remains available if pasting fails.
-Clipboard restoration covers eagerly readable pasteboard data. macOS does
-not expose every lazy or promised representation.
+Choose `Enable Dictation` and `Enable Gestures`, focus a text field, hold either
+Option key, speak after Recording appears, then release. `Copy Last Transcript`
+remains available if pasting fails. Option-letter, modifier, mouse and scroll
+chords cancel capture without transcription or paste; cancelled audio remains
+available in History for explicit retry or deletion.
+Holding for 250 ms starts dictation. A same-side second press within 300 ms
+toggles session recording when released before the hold threshold.
 
-Press Command+Shift+R once to start recording microphone and Mac audio, then
-again to stop, save, and transcribe. The menu and history window offer the same
-`Start Recording` / `Stop Recording` button. Recording continues when you
-release the shortcut. Lalia shows elapsed and remaining time, warns with five
-minutes remaining, then saves and transcribes at 60 minutes. It does not start
-another recording. Holding the shortcut does not toggle repeatedly. Lalia
-ignores the toggle while starting, saving, or dictating. Use
+If Input Monitoring is lost, Secure Event Input starts, or the Mac sleeps,
+Lalia saves active audio without automatic transcription or analysis. After
+wake or when Secure Event Input ends, choose `Enable Gestures` to restore the
+listener; gestures rearm only after all keys are released. Clipboard restoration
+covers eagerly readable pasteboard data. macOS does not expose every lazy or
+promised representation.
+
+Double-tap the same Option key to start recording microphone and Mac audio,
+then double-tap it again to stop, save, and transcribe. The menu and history
+window offer the same `Start Recording` / `Stop Recording` button. Recording
+continues when you release the key. Lalia shows elapsed and remaining time,
+warns with five minutes remaining, then saves and transcribes at 60 minutes. It does not start
+another recording. Holding the key does not toggle repeatedly. Lalia ignores
+the toggle while starting, saving, or dictating. Use
 headphones to reduce Mac playback leaking into the microphone.
 
 You can start another recording or dictate while earlier audio is transcribing.

@@ -19,6 +19,7 @@ protocol Recording: AnyObject { func start(at file: URL) throws; func stop() thr
 struct AuthorizationStatus: Equatable {
     let microphoneGranted: Bool
     let accessibilityGranted: Bool
+    var listeningAccessGranted = true
     var ready: Bool { microphoneGranted && accessibilityGranted }
 }
 
@@ -26,6 +27,7 @@ struct AuthorizationStatus: Equatable {
     func currentStatus() -> AuthorizationStatus
     func requestAll() async -> AuthorizationStatus
     func requestMicrophone() async -> Bool
+    func requestListeningAccess() async -> Bool
 }
 
 enum Phase: Equatable { case needsPermission, preparing, idle, recording, recordingSession, stopping }

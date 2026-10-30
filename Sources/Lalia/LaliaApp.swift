@@ -57,10 +57,12 @@ import SwiftUI
 }
 @MainActor final class AppDelegate: NSObject, NSApplicationDelegate {
     var coordinator: DictationCoordinator?
+    var gestureMonitor: OptionGestureMonitor?
     private var terminating = false
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminating else { return .terminateLater }
         terminating = true
+        gestureMonitor?.stop()
         Task { await coordinator?.shutdown(); sender.reply(toApplicationShouldTerminate: true) }
         return .terminateLater
     }
@@ -70,25 +72,32 @@ struct LaliaApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
     @StateObject private var coordinator: DictationCoordinator
     @StateObject private var playback: SessionPlayback
-    private let hotkeys: [CarbonHotkey]
+    private let gestures: OptionGestureMonitor
     init() {
         let playback = SessionPlayback()
         let coordinator = DictationCoordinator(recorder: Recorder(), transcriber: OMLXClient(), injector: PasteInjector(), authorizer: SystemAuthorizer(), playback: playback)
         _coordinator = StateObject(wrappedValue: coordinator)
         _playback = StateObject(wrappedValue: playback)
-        hotkeys = [
-            CarbonHotkey(shortcut: .dictation, pressed: { coordinator.hotkeyPressed() }, released: { coordinator.hotkeyReleased() }),
-            CarbonHotkey(shortcut: .recording, pressed: { coordinator.toggleRecording() }),
-        ]
-        coordinator.startupRefresh()
-        for hotkey in hotkeys {
-            do { try hotkey.register() } catch { coordinator.hotkeyRegistrationFailed(error, shortcut: hotkey.shortcut) }
+        let gestures = OptionGestureMonitor()
+        self.gestures = gestures
+        delegate.gestureMonitor = gestures
+        gestures.onAction = { action in
+            switch action {
+            case let .beginDictation(id): coordinator.gestureBegan(id)
+            case let .finishDictation(id): coordinator.gestureFinished(id)
+            case let .cancelDictation(id): coordinator.gestureCancelled(id)
+            case let .toggleRecording(id): coordinator.gestureToggle(id)
+            }
         }
+        gestures.onAvailability = { available, message in coordinator.setGestureAvailability(available, message: message) }
+        coordinator.onCaptureAvailabilityChanged = { gestures.setCaptureAvailable($0) }
+        coordinator.startupRefresh()
+        gestures.start()
         delegate.coordinator = coordinator
     }
     var body: some Scene {
         MenuBarExtra("Lalia", systemImage: coordinator.phase == .recording || coordinator.phase == .recordingSession ? "record.circle.fill" : "waveform") {
-            LaliaMenu(coordinator: coordinator)
+            LaliaMenu(coordinator: coordinator, gestures: gestures)
                 .onAppear { delegate.coordinator = coordinator }
         }
         Window("Lalia Recordings", id: "history") {
@@ -101,14 +110,22 @@ struct LaliaApp: App {
 
 private struct LaliaMenu: View {
     @ObservedObject var coordinator: DictationCoordinator
+    let gestures: OptionGestureMonitor
     @Environment(\.openWindow) private var openWindow
     @State private var setupMessage: String?
     var body: some View {
         Text(coordinator.message)
-        if let hotkeyError = coordinator.hotkeyError { Text(hotkeyError) }
         if !coordinator.isDictationEnabled {
             Button("Enable Dictation") { Task { await coordinator.enableDictation() } }.disabled(!coordinator.available)
         }
+        if !coordinator.gestureAvailable {
+            Button("Enable Gestures") {
+                Task {
+                    if await coordinator.enableGestures() { gestures.start() }
+                }
+            }
+        }
+        if let gestureMessage = coordinator.gestureMessage { Text(gestureMessage) }
         RecordingButton(coordinator: coordinator)
         if !coordinator.processing.isEmpty { Text("\(coordinator.processing.count) recordings queued or processing") }
         if coordinator.canCancel { Button("Cancel Current Processing") { coordinator.cancelProcessing() } }
@@ -136,10 +153,10 @@ struct RecordingButton: View {
             Text("\(SessionRecord.timestamp(coordinator.recordingElapsed)) elapsed · \(SessionRecord.timestamp(coordinator.recordingRemaining)) remaining")
                 .foregroundStyle(coordinator.recordingWarning ? .orange : .secondary)
         }
-        Button(coordinator.phase == .recordingSession ? "Stop Recording (⇧⌘R)" : "Start Recording (⇧⌘R)") {
+        Button(coordinator.phase == .recordingSession ? "Stop Recording" : "Start Recording") {
             coordinator.toggleRecording()
         }
-        .disabled(coordinator.phase != .recordingSession && !coordinator.available)
-        .help("Record microphone and Mac audio for up to 60 minutes, then add speaker labels.")
+        .disabled(coordinator.phase != .recordingSession && (!coordinator.available || !coordinator.gestureAvailable))
+        .help("Hold either Option key twice to start or stop recording microphone and Mac audio for up to 60 minutes.")
     }
 }

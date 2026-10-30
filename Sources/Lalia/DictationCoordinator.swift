@@ -2,10 +2,11 @@ import Combine
 import Foundation
 
 @MainActor final class DictationCoordinator: ObservableObject {
-    @Published private(set) var phase: Phase = .needsPermission
-    @Published private(set) var message = "Press ⇧⌘R to record, or enable dictation."
+    @Published private(set) var phase: Phase = .needsPermission { didSet { notifyCaptureAvailability() } }
+    @Published private(set) var message = "Enable dictation and gestures to get started."
     @Published private(set) var lastTranscript: String?
-    @Published private(set) var hotkeyError: String?
+    @Published private(set) var gestureAvailable = false { didSet { notifyCaptureAvailability() } }
+    @Published private(set) var gestureMessage: String?
     @Published private(set) var isDictationEnabled = false
     @Published private(set) var sessions: [SessionRecord] = []
     @Published private(set) var diagnostics: [String] = []
@@ -22,6 +23,7 @@ import Foundation
     private var activeSession: UUID?
     private var lastTranscriptSession: UUID?
     private var dictationSegment: UUID?
+    private var gestureDictation: UUID?
     private var captureOperation: Task<Void, Never>?
     private enum Work {
         case transcription(paste: Bool, generation: UUID?), analysis(reprocess: Bool), notes
@@ -37,10 +39,16 @@ import Foundation
     private var deadline: Task<Void, Never>?
     let recordingLimit: Double
     private let warningSeconds: Double
+    var onCaptureAvailabilityChanged: (@MainActor (Bool) -> Void)? { didSet { notifyCaptureAvailability() } }
+    private var readyMessage: String { gestureAvailable ? "Ready. Hold either Option key to dictate." : "Dictation is ready. Enable Gestures to use Option keys." }
+    private var canBeginGestureCapture: Bool {
+        gestureAvailable && phase == .idle && authorizer.currentStatus().microphoneGranted && !quitting
+    }
     var recordingRemaining: Double { max(0, recordingLimit - recordingElapsed) }
     var available: Bool { !quitting && (phase == .idle || phase == .needsPermission) }
     var canCancel: Bool { currentJob != nil }
     func canProcess(_ id: UUID) -> Bool { !quitting && id != activeSession && processing[id] == nil }
+    private func notifyCaptureAvailability() { onCaptureAvailabilityChanged?(canBeginGestureCapture) }
 
     init(recorder: Recording, transcriber: Transcribing, injector: Injecting, authorizer: Authorizing,
          store: SessionStore = SessionStore(), capture: SessionCapturing = SessionCapture(),
@@ -53,7 +61,7 @@ import Foundation
     }
     func startupRefresh() {
         refreshHistory(recover: true)
-        if authorizer.currentStatus().ready { isDictationEnabled = true; phase = .idle; message = "Ready. Hold ⇧⌘D to dictate." }
+        if authorizer.currentStatus().ready { isDictationEnabled = true; phase = .idle; message = readyMessage }
     }
     func refreshHistory(recover: Bool = false) {
         do { let history = try store.history(recover: recover); sessions = history.records; diagnostics = history.diagnostics }
@@ -66,10 +74,22 @@ import Foundation
         guard (await authorizer.requestAll()).ready else {
             phase = .needsPermission; message = "Microphone and Accessibility permissions are required for dictation."; return
         }
-        isDictationEnabled = true; phase = .idle; message = "Ready. Hold ⇧⌘D to dictate."
+        isDictationEnabled = true; phase = .idle; message = readyMessage
     }
-    func hotkeyPressed() {
-        guard available, isDictationEnabled else { return }
+    func setGestureAvailability(_ available: Bool, message: String? = nil) {
+        let wasCapturing = phase == .recording || phase == .recordingSession || phase == .preparing
+        gestureAvailable = available
+        gestureMessage = message
+        if !available { gestureListenerLost() }
+        if isDictationEnabled && phase == .idle && (available || !wasCapturing) { self.message = readyMessage }
+    }
+    func enableGestures() async -> Bool {
+        let allowed = await authorizer.requestListeningAccess()
+        if !allowed { gestureMessage = "Enable Input Monitoring for Lalia, then choose Enable Gestures." }
+        return allowed
+    }
+    func gestureBegan(_ id: UUID) {
+        guard gestureAvailable, available, isDictationEnabled else { return }
         guard authorizer.currentStatus().ready else {
             isDictationEnabled = false; phase = .needsPermission
             message = "Microphone and Accessibility permissions are required for dictation."
@@ -84,19 +104,46 @@ import Foundation
             try store.update(session.id) { $0.segments.append(segment) }
             let file = try store.file(session.id, segment.partialFilename)
             try store.privateFile(file)
-            playback.stop()
-            try recorder.start(at: file)
-            phase = .recording; message = "Recording dictation…"
+            playback.stop(); try recorder.start(at: file)
+            gestureDictation = id; phase = .recording; message = "Recording dictation…"
         } catch {
-            recorder.close()
-            recordCaptureFailure(error)
-            activeSession = nil; dictationSegment = nil; phase = .idle
+            recorder.close(); recordCaptureFailure(error)
+            activeSession = nil; dictationSegment = nil; gestureDictation = nil; phase = .idle
         }
         refreshHistory()
     }
-    func hotkeyReleased() {
-        guard phase == .recording else { return }
+    func gestureFinished(_ id: UUID) {
+        guard gestureDictation == id else { return }
+        gestureDictation = nil
         finishDictation(transcribe: true)
+    }
+    func gestureCancelled(_ id: UUID) {
+        guard gestureDictation == id else { return }
+        let session = activeSession
+        gestureDictation = nil
+        finishDictation(transcribe: false)
+        if let session {
+            do {
+                try store.update(session) { $0.captureError = "Dictation cancelled. Audio was saved without transcription." }
+                refreshHistory()
+            } catch { message = "Dictation cancelled, but its saved status could not be updated: \(error.localizedDescription)"; return }
+        }
+        message = "Dictation cancelled. Audio was saved without transcription."
+    }
+    func gestureToggle(_ id: UUID) {
+        guard gestureAvailable, phase != .preparing, phase != .stopping else { return }
+        if phase == .recordingSession { stopSession() }
+        else if available { startSession() }
+    }
+    func gestureListenerLost() {
+        if phase == .recording, let id = gestureDictation { gestureCancelled(id) }
+        if phase == .recordingSession {
+            phase = .stopping
+            captureOperation = Task {
+                await finishSession(transcribe: false, failure: LaliaError("Gesture monitoring was lost. Audio was saved without analysis; use Retry to transcribe."))
+            }
+        }
+        else if phase == .preparing { captureGeneration = UUID(); captureOperation?.cancel() }
     }
     private func finishDictation(transcribe: Bool) {
         guard let id = activeSession, let segment = dictationSegment else { return }
@@ -114,8 +161,9 @@ import Foundation
         refreshHistory()
     }
     func startSession() {
-        guard available else { return }
+        guard gestureAvailable, available else { return }
         captureGeneration = UUID()
+        let generation = captureGeneration
         phase = .preparing; message = "Starting microphone and Mac audio…"
         startingFailure = nil
         captureOperation = Task {
@@ -132,6 +180,11 @@ import Foundation
                 let started = ContinuousClock.now
                 try await capture.start(session: session.id, store: store, maximumDuration: recordingLimit) { [weak self] error in
                     self?.captureFailed(error)
+                }
+                guard generation == captureGeneration, !quitting else {
+                    phase = .stopping
+                    await finishSession(transcribe: false)
+                    return
                 }
                 if let startingFailure {
                     phase = .stopping
@@ -334,7 +387,7 @@ import Foundation
                 guard authorizer.currentStatus().accessibilityGranted else { processingMessage("Accessibility permission is required to paste.", for: id); return }
                 processingMessage("Pasting…", for: id)
                 try await injector.inject(transcript)
-                processingMessage("Ready. Hold ⇧⌘D to dictate.", for: id)
+                processingMessage(readyMessage, for: id)
             } else { processingMessage("Transcript saved.", for: id) }
         } catch {
             let failure = Task.isCancelled ? "Processing cancelled. Saved audio and completed transcripts are retained." : error.localizedDescription
@@ -447,10 +500,6 @@ import Foundation
         } catch { message = error.localizedDescription }
     }
     func copyLastTranscript() { if let lastTranscript { do { try injector.copy(lastTranscript); message = "Copied last transcript." } catch { message = error.localizedDescription } } }
-    func hotkeyRegistrationFailed(_ error: Error, shortcut: Shortcut) {
-        let failure = "Could not register \(shortcut.label): \(error.localizedDescription)"
-        hotkeyError = hotkeyError.map { "\($0)\n\(failure)" } ?? failure
-    }
 }
 
 private final class RecordingActivity {

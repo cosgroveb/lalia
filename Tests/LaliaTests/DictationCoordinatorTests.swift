@@ -13,7 +13,7 @@ import Testing
             test.coordinator.reprocess(saved.id)
             while !test.transcriber.waiting { await Task.yield() }
             if session { test.coordinator.startSession() }
-            else { test.coordinator.hotkeyPressed() }
+            else { test.beginGestureDictation() }
             for _ in 0..<20 { await Task.yield() }
             let expected: Phase = session ? .recordingSession : .recording
             #expect(test.coordinator.phase == expected)
@@ -30,7 +30,7 @@ import Testing
         test.transcriber.suspend = true
         test.coordinator.reprocess(saved.id)
         while !test.transcriber.waiting { await Task.yield() }
-        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        test.beginGestureDictation(); test.finishGestureDictation()
         let dictation = try #require(test.coordinator.sessions.first { $0.kind == .dictation })
         #expect(test.coordinator.processing[dictation.id] == "Queued")
         test.coordinator.retry(dictation.id)
@@ -63,9 +63,9 @@ import Testing
         let test = CoordinatorFixture()
         await test.coordinator.enableDictation()
         test.transcriber.suspend = true
-        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        test.beginGestureDictation(); test.finishGestureDictation()
         while !test.transcriber.waiting { await Task.yield() }
-        test.coordinator.hotkeyPressed()
+        test.beginGestureDictation()
         test.transcriber.resume()
         await test.coordinator.waitForOperation()
         #expect(test.coordinator.phase == .recording)
@@ -73,7 +73,7 @@ import Testing
         #expect(test.injector.copied.isEmpty)
         test.transcriber.suspend = false
         test.transcriber.output = "new dictation"
-        test.coordinator.hotkeyReleased()
+        test.finishGestureDictation()
         await test.coordinator.waitForOperation()
         #expect(test.injector.injected == ["new dictation"])
         #expect(test.coordinator.lastTranscript == "new dictation")
@@ -170,7 +170,7 @@ import Testing
                 await test.coordinator.waitForOperation()
             } else {
                 await test.coordinator.enableDictation()
-                test.coordinator.hotkeyPressed()
+                test.beginGestureDictation()
             }
             #expect(events.values == ["stop playback", session ? "start session" : "start dictation"])
             await test.coordinator.shutdown()
@@ -375,17 +375,17 @@ import Testing
             #expect(try sleepAssertions(for: id).isEmpty)
         }
     }
-    @Test func enablesOfflineAndGatesOverlappingHotkeys() async throws {
+    @Test func enablesOfflineAndGatesOverlappingGestures() async throws {
         let test = CoordinatorFixture()
         test.transcriber.prepareError = TestError.failed
         await test.coordinator.enableDictation()
         #expect(test.coordinator.isDictationEnabled)
         #expect(test.transcriber.prepareCalls == 0)
-        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyPressed()
+        test.beginGestureDictation(); test.beginGestureDictation()
         #expect(test.recorder.startCalls == 1)
         await test.coordinator.enableDictation()
         #expect(test.authorizer.requestCalls == 1)
-        test.coordinator.hotkeyReleased(); test.coordinator.hotkeyReleased()
+        test.finishGestureDictation(); test.finishGestureDictation()
         await test.coordinator.waitForOperation()
         #expect(test.recorder.stopCalls == 1)
         let saved = try #require(test.coordinator.sessions.first)
@@ -398,12 +398,12 @@ import Testing
         await test.coordinator.enableDictation()
         #expect(test.coordinator.phase == .needsPermission)
         #expect(!test.coordinator.isDictationEnabled)
-        test.coordinator.hotkeyReleased()
+        test.finishGestureDictation()
         #expect(test.recorder.stopCalls == 0)
         test.authorizer.status = TestAuthorizer.granted
         await test.coordinator.enableDictation()
         test.authorizer.status = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: false)
-        test.coordinator.hotkeyPressed()
+        test.beginGestureDictation()
         #expect(test.coordinator.phase == .needsPermission)
         #expect(test.recorder.startCalls == 0)
     }
@@ -413,7 +413,7 @@ import Testing
         let task = Task { await test.coordinator.enableDictation() }
         while !test.authorizer.waiting { await Task.yield() }
         #expect(test.coordinator.phase == .preparing)
-        test.coordinator.hotkeyReleased()
+        test.finishGestureDictation()
         await test.coordinator.enableDictation()
         #expect(test.authorizer.requestCalls == 1)
         #expect(test.recorder.stopCalls == 0)
@@ -428,7 +428,7 @@ import Testing
             if failure == "stop" { test.recorder.stopError = TestError.failed }
             if failure == "transcription" { test.transcriber.transcriptionError = TestError.failed }
             await test.coordinator.enableDictation()
-            test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+            test.beginGestureDictation(); test.finishGestureDictation()
             await test.coordinator.waitForOperation()
             #expect(test.coordinator.phase == .idle)
             #expect(test.injector.injected.isEmpty)
@@ -447,7 +447,7 @@ import Testing
         let test = CoordinatorFixture()
         await test.coordinator.enableDictation()
         test.transcriber.transcriptionError = LaliaError("MOSS completion could not be verified: invalid token usage.")
-        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        test.beginGestureDictation(); test.finishGestureDictation()
         await test.coordinator.waitForOperation()
         let failed = try #require(test.coordinator.sessions.first)
         let audio = try test.storage.store.file(failed.id, failed.segments[0].filename)
@@ -466,11 +466,11 @@ import Testing
         for failure in ["empty", "permission", "paste", "none"] {
             let test = CoordinatorFixture()
             await test.coordinator.enableDictation()
-            test.coordinator.hotkeyPressed()
+            test.beginGestureDictation()
             if failure == "empty" { test.transcriber.output = " \n\t" }
             if failure == "permission" { test.authorizer.status = AuthorizationStatus(microphoneGranted: true, accessibilityGranted: false) }
             if failure == "paste" { test.injector.injectionError = TestError.failed }
-            test.coordinator.hotkeyReleased()
+            test.finishGestureDictation()
             await test.coordinator.waitForOperation()
             if failure == "empty" {
                 #expect(test.coordinator.lastTranscript == nil)
@@ -490,7 +490,7 @@ import Testing
         test.coordinator.startSession()
         await test.coordinator.waitForOperation()
         #expect(test.coordinator.phase == .recordingSession)
-        test.coordinator.hotkeyPressed()
+        test.beginGestureDictation()
         test.coordinator.startSession()
         #expect(test.recorder.startCalls == 0)
         #expect(test.capture.startCalls == 1)
@@ -510,7 +510,7 @@ import Testing
             await test.coordinator.waitForOperation()
             #expect(test.coordinator.phase == .recordingSession)
             #expect(test.capture.startCalls == count)
-            test.coordinator.hotkeyReleased()
+            test.finishGestureDictation()
             #expect(test.coordinator.phase == .recordingSession)
             test.coordinator.toggleRecording()
             #expect(test.coordinator.phase == .stopping)
@@ -528,12 +528,12 @@ import Testing
     @Test func recordingToggleDoesNotInterruptDictation() async {
         let test = CoordinatorFixture()
         await test.coordinator.enableDictation()
-        test.coordinator.hotkeyPressed()
+        test.beginGestureDictation()
         test.coordinator.toggleRecording()
         #expect(test.coordinator.phase == .recording)
         #expect(test.capture.startCalls == 0)
         #expect(test.recorder.stopCalls == 0)
-        test.coordinator.hotkeyReleased()
+        test.finishGestureDictation()
         await test.coordinator.waitForOperation()
         #expect(test.injector.injected == ["spoken text"])
     }
@@ -589,7 +589,7 @@ import Testing
         test.transcriber.suspend = true
         test.coordinator.retry(saved.id)
         while !test.transcriber.waiting { await Task.yield() }
-        test.coordinator.toggleRecording(); test.coordinator.hotkeyPressed(); test.coordinator.generateNotes(saved.id)
+        test.coordinator.toggleRecording(); test.beginGestureDictation(); test.coordinator.generateNotes(saved.id)
         for _ in 0..<20 { await Task.yield() }
         #expect(test.capture.startCalls == 1)
         #expect(test.recorder.startCalls == 0)
@@ -604,19 +604,73 @@ import Testing
         #expect(try test.storage.store.read(saved.id).segments[0].complete)
         await test.coordinator.shutdown()
     }
-    @Test func copyFailuresAndHotkeyRegistrationRemainVisible() async {
+    @Test func copyFailuresRemainVisible() async {
         let test = CoordinatorFixture()
         await test.coordinator.enableDictation()
-        test.coordinator.hotkeyPressed(); test.coordinator.hotkeyReleased()
+        test.beginGestureDictation(); test.finishGestureDictation()
         await test.coordinator.waitForOperation()
         test.injector.copyError = TestError.failed
         test.coordinator.copyLastTranscript()
-        test.coordinator.hotkeyRegistrationFailed(TestError.failed, shortcut: .dictation)
-        test.coordinator.hotkeyRegistrationFailed(TestError.failed, shortcut: .recording)
         #expect(test.coordinator.message == "Failed.")
-        #expect(test.coordinator.hotkeyError?.contains("Failed.") == true)
-        #expect(test.coordinator.hotkeyError?.contains("⇧⌘D") == true)
-        #expect(test.coordinator.hotkeyError?.contains("⇧⌘R") == true)
+    }
+
+    @Test func gestureCancellationRetainsAudioAndIgnoresLateRelease() async throws {
+        let test = CoordinatorFixture()
+        await test.coordinator.enableDictation()
+        test.coordinator.setGestureAvailability(true)
+        let id = UUID()
+        test.coordinator.gestureBegan(id)
+        #expect(test.coordinator.phase == .recording)
+        test.coordinator.gestureCancelled(id)
+        test.coordinator.gestureFinished(id)
+        await test.coordinator.waitForOperation()
+        let record = try #require(test.coordinator.sessions.first { $0.kind == .dictation })
+        #expect(record.captureState == .complete)
+        #expect(record.captureError == "Dictation cancelled. Audio was saved without transcription.")
+        #expect(record.transcriptionComplete == false)
+        #expect(test.transcriber.transcriptionCalls == 0)
+        #expect(test.injector.injected.isEmpty)
+        #expect(test.coordinator.message.contains("saved without transcription"))
+    }
+
+    @Test func listenerLossStopsSessionWithoutSubmittingAnalysis() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.setGestureAvailability(true)
+        test.coordinator.gestureToggle(UUID())
+        for _ in 0..<20 { await Task.yield() }
+        #expect(test.coordinator.phase == .recordingSession)
+        test.coordinator.setGestureAvailability(false, message: "listener lost")
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.phase == .idle)
+        #expect(test.capture.stopCalls == 1)
+        #expect(test.transcriber.sessionCalls == 0)
+        #expect(test.coordinator.sessions.first?.captureError?.contains("Gesture monitoring was lost") == true)
+    }
+
+    @Test func listenerLossDuringSessionStartCannotResumeCapture() async {
+        let test = CoordinatorFixture()
+        test.capture.suspend = true
+        test.coordinator.startSession()
+        while !test.capture.waiting { await Task.yield() }
+        test.coordinator.setGestureAvailability(false, message: "listener lost")
+        test.capture.resume()
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.phase == .idle)
+        #expect(test.capture.stopCalls == 1)
+        #expect(test.transcriber.sessionCalls == 0)
+    }
+
+    @Test func listenerLossWhileMicrophonePermissionIsPendingCannotStartSession() async {
+        let test = CoordinatorFixture()
+        test.authorizer.suspendMicrophone = true
+        test.coordinator.startSession()
+        while !test.authorizer.microphoneWaiting { await Task.yield() }
+        test.coordinator.setGestureAvailability(false, message: "listener lost")
+        test.authorizer.resumeMicrophone()
+        await test.coordinator.waitForOperation()
+        #expect(test.capture.startCalls == 0)
+        #expect(test.coordinator.sessions.isEmpty)
+        #expect(test.coordinator.phase == .idle)
     }
 }
 
@@ -644,7 +698,14 @@ private func sleepAssertions(for session: UUID) throws -> Set<String> {
     let playback = TestPlayback()
     var recordingLimit = SessionTranscriptionProfile.maximumDuration
     var warningSeconds = 300.0
-    lazy var coordinator = DictationCoordinator(recorder: recorder, transcriber: transcriber, injector: injector, authorizer: authorizer, store: storage.store, capture: capture, playback: playback, recordingLimit: recordingLimit, warningSeconds: warningSeconds)
+    private var gestureID = UUID()
+    lazy var coordinator: DictationCoordinator = {
+        let value = DictationCoordinator(recorder: recorder, transcriber: transcriber, injector: injector, authorizer: authorizer, store: storage.store, capture: capture, playback: playback, recordingLimit: recordingLimit, warningSeconds: warningSeconds)
+        value.setGestureAvailability(true)
+        return value
+    }()
+    func beginGestureDictation() { coordinator.gestureBegan(gestureID) }
+    func finishGestureDictation() { coordinator.gestureFinished(gestureID); gestureID = UUID() }
 }
 
 private final class PlaybackCaptureEvents { var values: [String] = [] }
@@ -676,10 +737,14 @@ private final class TestRecorder: Recording {
     var fail: (@MainActor @Sendable (Error) -> Void)?
     var writer: SourceAudioWriter?
     var amplitude: Float = 0.1
+    var suspend = false
+    var waiting = false
+    private var continuation: CheckedContinuation<Void, Never>?
     var onStart: (() -> Void)?
     func start(session: UUID, store: SessionStore, maximumDuration: Double, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
         onStart?()
         startCalls += 1; fail = failed
+        if suspend { waiting = true; await withCheckedContinuation { continuation = $0 }; waiting = false }
         if let startError { throw startError }
         writer = SourceAudioWriter(store: store, session: session, origin: 0, maximumDuration: maximumDuration)
         try writer?.append(pcm(frames: 48_000, amplitude: amplitude), source: .microphone, timestamp: 0)
@@ -688,6 +753,7 @@ private final class TestRecorder: Recording {
         stopCalls += 1; try writer?.finish(); writer = nil
         if let stopError { throw stopError }
     }
+    func resume() { continuation?.resume(); continuation = nil }
 }
 
 @MainActor private final class TestTranscriber: Transcribing {
@@ -747,12 +813,20 @@ private final class TestRecorder: Recording {
     var suspend = false
     var waiting = false
     private var continuation: CheckedContinuation<Void, Never>?
+    var suspendMicrophone = false
+    var microphoneWaiting = false
+    private var microphoneContinuation: CheckedContinuation<Void, Never>?
     func currentStatus() -> AuthorizationStatus { status }
     func requestAll() async -> AuthorizationStatus {
         requestCalls += 1
         if suspend { waiting = true; await withCheckedContinuation { continuation = $0 }; waiting = false }
         return status
     }
-    func requestMicrophone() async -> Bool { status.microphoneGranted }
+    func requestMicrophone() async -> Bool {
+        if suspendMicrophone { microphoneWaiting = true; await withCheckedContinuation { microphoneContinuation = $0 }; microphoneWaiting = false }
+        return status.microphoneGranted
+    }
+    func requestListeningAccess() async -> Bool { status.listeningAccessGranted }
     func resume() { continuation?.resume(); continuation = nil }
+    func resumeMicrophone() { microphoneContinuation?.resume(); microphoneContinuation = nil }
 }
