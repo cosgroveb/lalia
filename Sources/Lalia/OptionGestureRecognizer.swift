@@ -43,8 +43,11 @@ struct OptionGestureRecognizer {
     var trackedOptions: Set<OptionSide> { options }
     var trackedOtherKeys: Set<UInt16> { otherKeys }
     var hasPendingGesture: Bool {
-        if case .idle = state { return false }
-        return true
+        switch state {
+        case .idle: return false
+        case .blocked: return !options.isEmpty
+        default: return true
+        }
     }
     var holdDeadline: TimeInterval? {
         switch state {

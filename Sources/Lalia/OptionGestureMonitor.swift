@@ -23,13 +23,17 @@ struct OptionGestureListenerState {
     private(set) var enabled = false
     var hasPendingGesture: Bool { recognizer.hasPendingGesture }
     private(set) var captureActive = false
-    private var needsPhysicalStateCheck: Bool { hasPendingGesture || captureActive }
+    private var physicalStateTime: TimeInterval?
+    private var needsPhysicalStateCheck: Bool {
+        hasPendingGesture || captureActive || !trackedOptions.isEmpty || !trackedOtherKeys.isEmpty
+    }
     var holdDeadline: TimeInterval? { recognizer.holdDeadline }
     var trackedOptions: Set<OptionSide> { recognizer.trackedOptions }
     var trackedOtherKeys: Set<UInt16> { recognizer.trackedOtherKeys }
 
     mutating func enable(options: Set<OptionSide>, otherKeys: Set<UInt16>, at: TimeInterval) -> OptionGestureListenerTransition {
         enabled = true
+        physicalStateTime = nil
         let actions = recognizer.consume(.seed(options: options, otherKeys: otherKeys, at: at))
             + recognizer.consume(.availability(true))
         return OptionGestureListenerTransition(actions: actions, availability: true)
@@ -42,7 +46,7 @@ struct OptionGestureListenerState {
     }
 
     mutating func receive(_ input: GestureInput) -> [GestureAction] {
-        guard enabled else { return [] }
+        guard enabled, physicalStateTime.map({ input.timestamp >= $0 }) ?? true else { return [] }
         return recognizer.consume(input)
     }
 
@@ -51,10 +55,21 @@ struct OptionGestureListenerState {
         return recognizer.consume(.captureAvailability(available))
     }
 
-    mutating func validatePhysicalState(options: Set<OptionSide>, otherKeys: Set<UInt16>) -> OptionGestureListenerTransition? {
+    mutating func validatePhysicalState(options: Set<OptionSide>, otherKeys: Set<UInt16>, at: TimeInterval) -> OptionGestureListenerTransition? {
         guard needsPhysicalStateCheck,
               options != trackedOptions || otherKeys != trackedOtherKeys else { return nil }
-        return lose("Keyboard state changed without a matching event. Choose Enable Gestures to resume.")
+        let actions = recognizer.consume(.reset) + recognizer.consume(.seed(options: options, otherKeys: otherKeys, at: at))
+        physicalStateTime = at
+        return OptionGestureListenerTransition(actions: actions)
+    }
+}
+
+private extension GestureInput {
+    var timestamp: TimeInterval {
+        switch self {
+        case let .option(_, _, at), let .otherKey(_, _, _, at), let .mouse(_, _, at), let .tick(at), let .seed(_, _, at): at
+        case .reset, .availability, .captureAvailability: -.infinity
+        }
     }
 }
 
@@ -65,9 +80,9 @@ struct OptionGestureListenerState {
     ]
 
     static func healthFailure(permission: Bool, secureInput: Bool, tapEnabled: Bool) -> String? {
-        if !permission { return "Input Monitoring permission is unavailable." }
-        if secureInput { return "Secure Event Input is active." }
-        if !tapEnabled { return "Gesture listener was disabled." }
+        if !permission { return "Input Monitoring is off." }
+        if secureInput { return "Secure input is active." }
+        if !tapEnabled { return "Gesture listener stopped." }
         return nil
     }
 
@@ -82,7 +97,7 @@ struct OptionGestureListenerState {
     private var listener = OptionGestureListenerState()
     private lazy var actionDelivery = GestureActionDelivery(
         isHealthy: { [weak self] in self?.isListenerHealthy ?? false },
-        onUnhealthy: { [weak self] in self?.loseListener("Input Monitoring is unavailable or Secure Event Input is active. Enable Gestures after it ends.") },
+        onUnhealthy: { [weak self] in self?.loseListener("Gestures paused.") },
         deliver: { [weak self] in self?.onAction?($0) }
     )
     private var enabled = false
@@ -124,14 +139,19 @@ struct OptionGestureListenerState {
 
     func start(requestPermission: Bool = false) {
         if requestPermission { _ = CGRequestListenEventAccess() }
-        guard CGPreflightListenEventAccess(), !IsSecureEventInputEnabled() else { setAvailable(false, "Enable Input Monitoring for Lalia, then choose Enable Gestures after Secure Event Input ends."); return }
+        guard CGPreflightListenEventAccess() else {
+            setAvailable(false, "Input Monitoring is off."); return
+        }
+        guard !IsSecureEventInputEnabled() else {
+            setAvailable(false, "Secure input is active."); return
+        }
         guard tap == nil else { checkHealth(); return }
         let mask = Self.observedEventTypes.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
         guard let created = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
                                               options: .listenOnly, eventsOfInterest: CGEventMask(mask),
                                               callback: optionGestureTapCallback,
                                               userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
-            setAvailable(false, "Lalia could not start its Input Monitoring listener."); return
+            setAvailable(false, "Gesture listener unavailable."); return
         }
         tap = created
         source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, created, 0)
@@ -145,11 +165,11 @@ struct OptionGestureListenerState {
         let center = NSWorkspace.shared.notificationCenter
         for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.loseListener("Gesture listening paused. Enable Gestures to resume.") }
+                MainActor.assumeIsolated { self?.loseListener("Gestures paused.") }
             })
         }
         observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.loseListener("Gesture listening paused. Enable Gestures to resume.") }
+            MainActor.assumeIsolated { self?.loseListener("Gestures paused.") }
         })
         setAvailable(true, nil)
     }
@@ -176,13 +196,16 @@ struct OptionGestureListenerState {
     }
 
     fileprivate func receive(_ event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
-        guard enabled, let tap,
-              Self.healthFailure(permission: CGPreflightListenEventAccess(), secureInput: IsSecureEventInputEnabled(), tapEnabled: CGEvent.tapIsEnabled(tap: tap)) == nil else {
-            loseListener("Input Monitoring is unavailable or Secure Event Input is active. Enable Gestures after it ends.")
+        guard enabled, let tap else {
+            loseListener("Gesture listener unavailable.")
+            return Unmanaged.passUnretained(event)
+        }
+        if let failure = Self.healthFailure(permission: CGPreflightListenEventAccess(), secureInput: IsSecureEventInputEnabled(), tapEnabled: CGEvent.tapIsEnabled(tap: tap)) {
+            loseListener(failure)
             return Unmanaged.passUnretained(event)
         }
         if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
-            loseListener("Gesture listener was disabled. Choose Enable Gestures to retry.")
+            loseListener("Gesture listener stopped.")
         } else {
             for input in Self.normalizedInputs(for: event, type: type) {
                 dispatch(listener.receive(input))
@@ -207,14 +230,15 @@ struct OptionGestureListenerState {
     private func checkHealth() {
         guard enabled else { return }
         guard let tap else {
-            loseListener("Input Monitoring is unavailable or Secure Event Input is active. Enable Gestures after it ends."); return
+            loseListener("Gesture listener unavailable."); return
         }
         if let failure = Self.healthFailure(permission: CGPreflightListenEventAccess(), secureInput: IsSecureEventInputEnabled(), tapEnabled: CGEvent.tapIsEnabled(tap: tap)) {
-            loseListener("\(failure) Choose Enable Gestures to retry."); return
+            loseListener(failure); return
         }
         let actual = physicalState()
-        if let transition = listener.validatePhysicalState(options: actual.options, otherKeys: actual.keys) {
-            handleListenerLoss(transition)
+        if let transition = listener.validatePhysicalState(options: actual.options, otherKeys: actual.keys, at: eventTime) {
+            actionDelivery.invalidate()
+            apply(transition)
         }
     }
 
@@ -307,13 +331,19 @@ struct OptionGestureListenerState {
     private let onUnhealthy: @MainActor () -> Void
     private let deliver: @MainActor (GestureAction) -> Void
     private var generation = UUID()
+    private var activeDictationID: UUID?
 
     init(isHealthy: @escaping @MainActor () -> Bool, onUnhealthy: @escaping @MainActor () -> Void,
          deliver: @escaping @MainActor (GestureAction) -> Void) {
         self.isHealthy = isHealthy; self.onUnhealthy = onUnhealthy; self.deliver = deliver
     }
 
-    func invalidate() { generation = UUID() }
+    func invalidate() {
+        generation = UUID()
+        guard let id = activeDictationID else { return }
+        activeDictationID = nil
+        deliver(.cancelDictation(id))
+    }
 
     func send(_ actions: [GestureAction]) {
         let generation = generation
@@ -321,7 +351,26 @@ struct OptionGestureListenerState {
             DispatchQueue.main.async { [weak self] in
                 MainActor.assumeIsolated {
                     guard let self, self.generation == generation else { return }
-                    if case .cancelDictation = action {
+                    if case let .beginDictation(id) = action {
+                        guard self.isHealthy() else {
+                            self.invalidate()
+                            self.onUnhealthy()
+                            return
+                        }
+                        self.activeDictationID = id
+                        self.deliver(action)
+                    } else if case let .cancelDictation(id) = action {
+                        guard self.activeDictationID == id else { return }
+                        self.activeDictationID = nil
+                        self.deliver(action)
+                    } else if case let .finishDictation(id) = action {
+                        guard self.isHealthy() else {
+                            self.invalidate()
+                            self.onUnhealthy()
+                            return
+                        }
+                        guard self.activeDictationID == id else { return }
+                        self.activeDictationID = nil
                         self.deliver(action)
                     } else if self.isHealthy() {
                         self.deliver(action)

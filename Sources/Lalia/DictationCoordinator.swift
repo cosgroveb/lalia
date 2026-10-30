@@ -88,7 +88,7 @@ import Foundation
     }
     func enableGestures() async -> Bool {
         let allowed = await authorizer.requestListeningAccess()
-        if !allowed { gestureMessage = "Enable Input Monitoring for Lalia, then choose Enable Gestures." }
+        if !allowed { gestureMessage = "Allow Input Monitoring for Lalia." }
         return allowed
     }
     func gestureBegan(_ id: UUID) {
