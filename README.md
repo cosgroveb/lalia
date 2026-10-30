@@ -17,40 +17,49 @@ Recording permission. Accessibility is only for pasting.
 
 ## Install and configure
 
-Install the signed, notarized app through Homebrew:
+Install the signed, notarized app and its isolated transcription runtime:
 
 ```sh
 brew install --cask cosgroveb/tap/lalia
+lalia-runtime setup
 ```
 
-Run oMLX locally with `MOSS-Transcribe-Diarize` for dictation and recordings.
-The model is public. Both modes use the pinned oMLX 0.7.2 / mlx-audio 0.6.2
-fork at `67408c4910edd83935f5618780e51c403ded2676`, with JSON token usage,
-prompt forwarding and a 250 MB audio upload limit. Dictation requests cap output
-at 8,192 tokens, uploads at 20 MB, and requests at 30 minutes. Each dictation
-chunk is at most ten minutes. Dictation output contains speech text only; MOSS
-speaker labels, timestamps and sound events are omitted.
-Brian's `omlx-install-transcription` installs this compatibility patch and the
-pinned MOSS model. The installer refuses unknown runtime sources. Lalia rejects
-missing or inconsistent usage. New runtimes still require qualification.
+Setup downloads the public MOSS checkpoint, starts the local runtime, verifies
+transcription, then configures Lalia. The runtime owns its Python dependencies
+and API compatibility patches. It does not modify a separate oMLX installation.
+Use `Check Runtime Setup` in Lalia's menu to check server/model availability,
+or `Copy Setup Command` to get the installation command. Recordings remain
+available for Retry if the server is offline or incompatible.
 
-Lalia reads `~/.config/lalia/config.json`. A missing file uses these defaults.
-Older configurations with `sessionTranscriptionModel` migrate that value to
-`transcriptionModel`; the retired Cohere identifier migrates to MOSS. Other
-custom model identifiers are preserved. Malformed settings produce an error:
+The runtime uses loopback port 8002 and private state under
+`~/.local/share/lalia/runtime`. Its pinned oMLX 0.7.2 / mlx-audio 0.6.2 build
+includes the MOSS frequency correction at
+`67408c4910edd83935f5618780e51c403ded2676`, prompt forwarding, token usage,
+and a 250 MB upload limit. Models download during setup, not Homebrew installation.
+Notes use a separate local chat server. The runtime does not install a notes model.
+
+Lalia reads `~/.config/lalia/config.json`. New installations default to:
 
 ```json
 {
-  "baseURL": "http://127.0.0.1:8000/v1",
+  "baseURL": "http://127.0.0.1:8002/v1",
+  "summaryBaseURL": "http://127.0.0.1:8000/v1",
   "transcriptionModel": "MOSS-Transcribe-Diarize",
   "language": "en",
   "summaryModel": "Qwen3.6-35B-A3B-oQ8-mtp"
 }
 ```
 
-Only loopback endpoints are supported. Lalia disables redirects and system
-proxies for its HTTP client. Recording works while oMLX is offline. Retry
-transcription from history once the server and model are ready.
+Existing configurations without `summaryBaseURL` retain their existing endpoint
+for notes. Setup preserves custom endpoints and summary settings. Older
+`sessionTranscriptionModel` values and the retired Cohere identifier migrate as
+before. Existing compatible loopback servers remain supported. Both URLs must
+use loopback addresses. Lalia disables HTTP redirects and system proxies.
+
+Dictation requests cap output at 8,192 tokens, uploads at 20 MB, and requests at
+30 minutes. Each dictation chunk is at most ten minutes. Pasted text omits
+speaker labels, timestamps and sound events. Missing or inconsistent token
+usage fails analysis rather than accepting an incomplete response.
 
 ## Use
 

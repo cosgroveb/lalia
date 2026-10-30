@@ -102,6 +102,7 @@ struct LaliaApp: App {
 private struct LaliaMenu: View {
     @ObservedObject var coordinator: DictationCoordinator
     @Environment(\.openWindow) private var openWindow
+    @State private var setupMessage: String?
     var body: some View {
         Text(coordinator.message)
         if let hotkeyError = coordinator.hotkeyError { Text(hotkeyError) }
@@ -113,6 +114,15 @@ private struct LaliaMenu: View {
         if coordinator.canCancel { Button("Cancel Current Processing") { coordinator.cancelProcessing() } }
         Button("Recording History") { coordinator.refreshHistory(); openWindow(id: "history"); NSApp.activate() }
         Button("Copy Last Transcript") { coordinator.copyLastTranscript() }.disabled(coordinator.lastTranscript == nil)
+        Divider()
+        Button("Check Runtime Setup") {
+            Task { setupMessage = await OMLXClient().setupCheck() }
+        }
+        Button("Copy Setup Command") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("brew install cosgroveb/tap/lalia-runtime && lalia-runtime setup", forType: .string)
+        }
+        if let setupMessage { Text(setupMessage).textSelection(.enabled) }
         Divider()
         Button("About Lalia") { NSApp.orderFrontStandardAboutPanel(options: [:]); NSApp.activate() }
         Button("Quit") { NSApplication.shared.terminate(nil) }

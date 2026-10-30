@@ -26,4 +26,5 @@ rg -Fqx '  url "https://github.com/cosgroveb/lalia/releases/download/v#{version}
 rg -Fqx '  desc "Menu-bar voice dictation"' "$cask"
 rg -Fqx '  depends_on arch: :arm64' "$cask"
 rg -Fqx '  depends_on macos: :tahoe' "$cask"
+rg -Fqx '  depends_on formula: "cosgroveb/tap/lalia-runtime"' "$cask"
 rg -Fqx '  app "Lalia.app"' "$cask"

@@ -72,7 +72,10 @@ struct SpeakerTranscript: Codable, Identifiable, Sendable {
         guard duration.isFinite, duration > 0, duration <= SessionTranscriptionProfile.maximumSavedDuration,
               let raw = attempt.rawResponse else { throw LaliaError("Session analysis has no valid saved audio or response.") }
         let response = try JSONDecoder().decode(Transcription.self, from: raw).validated(duration: duration)
-        guard let usage = response.usage, usage.type == "tokens", usage.inputTokens > 0,
+        guard let usage = response.usage else {
+            throw LaliaError("MOSS completion could not be verified: token usage is missing. This server may lack the required API support. Install or update the packaged runtime with `brew install cosgroveb/tap/lalia-runtime && lalia-runtime setup`, then Check Runtime Setup. Audio and the previous transcript are retained.")
+        }
+        guard usage.type == "tokens", usage.inputTokens > 0,
               usage.outputTokens >= 0, usage.outputTokens < attempt.profile.maximumTokens,
               usage.outputTokens > 0 || trimmedTranscript(response.text) == nil,
               usage.inputTokens <= attempt.profile.contextTokens - attempt.profile.maximumTokens,

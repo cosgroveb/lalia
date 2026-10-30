@@ -53,6 +53,8 @@ jobs:
           set -euo pipefail
           shellcheck Support/*.sh Tests/System/*.sh
           ruby -c Support/render-homebrew-cask.rb
+          ruby -c Support/render-homebrew-runtime.rb
+          python3 -m unittest discover -s Tests/Runtime
           plutil -lint Support/Info.plist Support/Lalia.entitlements
           swift test
           Tests/System/check-app.sh
@@ -198,17 +200,23 @@ jobs:
           path: homebrew-tap
           ssh-key: ${{ secrets.HOMEBREW_TAP_DEPLOY_KEY }}
 
-      - name: Render and commit cask
+      - name: Render and commit runtime and cask
         run: |
           set -euo pipefail
           version=${{ needs.release.outputs.version }}
+          curl --fail --location --retry 3 \
+            "https://github.com/cosgroveb/lalia/archive/refs/tags/v$version.tar.gz" \
+            -o "$RUNNER_TEMP/lalia-source.tar.gz"
+          source_sha=$(shasum -a 256 "$RUNNER_TEMP/lalia-source.tar.gz" | awk '{print $1}')
+          Support/render-homebrew-runtime.rb "$version" "$source_sha" \
+            "$GITHUB_WORKSPACE/homebrew-tap/Formula/lalia-runtime.rb"
           Support/render-homebrew-cask.rb "$version" \
             "${{ steps.checksum.outputs.sha256 }}" \
             "$GITHUB_WORKSPACE/homebrew-tap/Casks/lalia.rb"
           cd "$GITHUB_WORKSPACE/homebrew-tap"
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add Casks/lalia.rb
+          git add Casks/lalia.rb Formula/lalia-runtime.rb
           if git diff --cached --quiet; then
             echo "Cask already contains Lalia $version"
           else
@@ -222,6 +230,9 @@ jobs:
           set -euo pipefail
           brew tap cosgroveb/tap "file://$GITHUB_WORKSPACE/homebrew-tap"
           brew trust --cask cosgroveb/tap/lalia
+          brew style cosgroveb/tap/lalia-runtime
+          brew install cosgroveb/tap/lalia-runtime
+          brew test cosgroveb/tap/lalia-runtime
           brew style --cask cosgroveb/tap/lalia
           brew audit --cask --strict --online cosgroveb/tap/lalia
           brew livecheck --cask cosgroveb/tap/lalia

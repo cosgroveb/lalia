@@ -95,6 +95,29 @@ struct SpeakerTranscriptTests {
             #expect(throws: Error.self) { try SpeakerTranscript(attempt: speakerAttempt(response), duration: 2) }
         }
     }
+    @Test func missingUsageSuggestsRuntimeButOrdinaryMalformedOutputDoesNot() throws {
+        let good = try #require(speakerAttempt().rawResponse)
+        var json = try #require(JSONSerialization.jsonObject(with: good) as? [String: Any])
+        json.removeValue(forKey: "usage")
+        let missingUsage = SessionAnalysis.Attempt(profile: SessionTranscriptionProfile(), rawResponse: try JSONSerialization.data(withJSONObject: json))
+        do {
+            _ = try SpeakerTranscript(attempt: missingUsage, duration: 2)
+            Issue.record("MOSS response without usage unexpectedly succeeded.")
+        } catch {
+            #expect(error.localizedDescription.contains("token usage is missing"))
+            #expect(error.localizedDescription.contains("lalia-runtime setup"))
+        }
+
+        var response = try JSONDecoder().decode(Transcription.self, from: good)
+        response.text = "unmatched model output"
+        do {
+            _ = try SpeakerTranscript(attempt: speakerAttempt(response), duration: 2)
+            Issue.record("Malformed MOSS output unexpectedly succeeded.")
+        } catch {
+            #expect(error.localizedDescription.contains("raw output"))
+            #expect(!error.localizedDescription.contains("lalia-runtime setup"))
+        }
+    }
     @Test func rejectsUnmatchedRawTextAndMalformedTimingsWithoutDroppingSpeech() throws {
         let good = try JSONDecoder().decode(Transcription.self, from: #require(speakerAttempt().rawResponse))
         for raw in ["discarded " + good.text, good.text + " discarded", good.text + "[2][S01]unfinished", "[0][S01]different[1]"] {

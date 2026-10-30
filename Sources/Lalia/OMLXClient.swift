@@ -1,19 +1,23 @@
 import Foundation
 
 struct OMLXConfiguration: Codable, Sendable {
-    var baseURL = "http://127.0.0.1:8000/v1"
+    var baseURL = "http://127.0.0.1:8002/v1"
+    var summaryBaseURL = "http://127.0.0.1:8000/v1"
     var transcriptionModel = "MOSS-Transcribe-Diarize"
     var language = "en"
     var summaryModel = "Qwen3.6-35B-A3B-oQ8-mtp"
-    enum CodingKeys: String, CodingKey { case baseURL, transcriptionModel, language, summaryModel, sessionTranscriptionModel }
-    init(baseURL: String = "http://127.0.0.1:8000/v1", transcriptionModel: String = "MOSS-Transcribe-Diarize",
+    static let defaultBaseURL = "http://127.0.0.1:8002/v1"
+    static let defaultSummaryBaseURL = "http://127.0.0.1:8000/v1"
+    enum CodingKeys: String, CodingKey { case baseURL, summaryBaseURL, transcriptionModel, language, summaryModel, sessionTranscriptionModel }
+    init(baseURL: String = defaultBaseURL, summaryBaseURL: String? = nil, transcriptionModel: String = "MOSS-Transcribe-Diarize",
          language: String = "en", summaryModel: String = "Qwen3.6-35B-A3B-oQ8-mtp") {
-        self.baseURL = baseURL; self.transcriptionModel = transcriptionModel; self.language = language
+        self.baseURL = baseURL; self.summaryBaseURL = summaryBaseURL ?? (baseURL == Self.defaultBaseURL ? Self.defaultSummaryBaseURL : baseURL); self.transcriptionModel = transcriptionModel; self.language = language
         self.summaryModel = summaryModel
     }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         baseURL = try values.decode(String.self, forKey: .baseURL)
+        summaryBaseURL = try values.decodeIfPresent(String.self, forKey: .summaryBaseURL) ?? baseURL
         let legacyModel = try values.decodeIfPresent(String.self, forKey: .sessionTranscriptionModel)
         let configuredModel = try values.decode(String.self, forKey: .transcriptionModel)
         transcriptionModel = legacyModel ?? (configuredModel == "cohere-transcribe-03-2026" ? "MOSS-Transcribe-Diarize" : configuredModel)
@@ -23,6 +27,7 @@ struct OMLXConfiguration: Codable, Sendable {
     func encode(to encoder: Encoder) throws {
         var values = encoder.container(keyedBy: CodingKeys.self)
         try values.encode(baseURL, forKey: .baseURL)
+        try values.encode(summaryBaseURL, forKey: .summaryBaseURL)
         try values.encode(transcriptionModel, forKey: .transcriptionModel)
         try values.encode(language, forKey: .language)
         try values.encode(summaryModel, forKey: .summaryModel)
@@ -33,18 +38,27 @@ struct OMLXConfiguration: Codable, Sendable {
         do {
             let config = try JSONDecoder().decode(Self.self, from: Data(contentsOf: file))
             _ = try config.endpoint("models")
+            _ = try config.summaryEndpoint("models")
             return config
         } catch { throw LaliaError("Invalid Lalia configuration at \(file.path): \(error.localizedDescription)") }
     }
 
     func endpoint(_ path: String) throws -> URL {
+        try validatedEndpoint(baseURL, path)
+    }
+
+    func summaryEndpoint(_ path: String) throws -> URL {
+        try validatedEndpoint(summaryBaseURL, path)
+    }
+
+    private func validatedEndpoint(_ baseURL: String, _ path: String) throws -> URL {
         guard let parts = URLComponents(string: baseURL), let url = parts.url,
               ["http", "https"].contains(parts.scheme?.lowercased() ?? ""),
               ["127.0.0.1", "localhost", "[::1]", "::1"].contains(parts.host?.lowercased() ?? ""),
               parts.user == nil, parts.password == nil, parts.query == nil, parts.fragment == nil,
               ["/v1", "/v1/"].contains(parts.path),
               !transcriptionModel.isEmpty, !summaryModel.isEmpty, !language.isEmpty else {
-            throw LaliaError("Lalia requires a loopback oMLX baseURL ending in /v1 and nonempty model/language settings.")
+            throw LaliaError("Lalia requires loopback API URLs ending in /v1 and nonempty model/language settings.")
         }
         return url.appending(path: path)
     }
@@ -78,13 +92,22 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
         try await prepare(model: config.transcriptionModel, endpoint: config.endpoint("models"))
     }
 
+    func setupCheck() async -> String {
+        do {
+            try await prepare()
+            return "Transcription server and model are available. Full inference compatibility is confirmed when you transcribe."
+        } catch { return error.localizedDescription }
+    }
+
     private func prepare(model: String, endpoint: URL) async throws {
-        let (data, response) = try await session.data(from: endpoint)
-        try check(response)
+        let (data, response): (Data, URLResponse)
+        do { (data, response) = try await session.data(from: endpoint) }
+        catch { throw LaliaError("Cannot reach the local transcription runtime. Run `brew install cosgroveb/tap/lalia-runtime && lalia-runtime setup`, then Check Runtime Setup. (\(error.localizedDescription))") }
+        try check(response, purpose: "transcription runtime")
         struct Models: Decodable { struct Model: Decodable { var id: String }; var data: [Model] }
         let models = try JSONDecoder().decode(Models.self, from: data)
         guard models.data.contains(where: { $0.id == model }) else {
-            throw LaliaError("oMLX has no model named \(model). Recording is saved. Install the model, then Retry.")
+            throw LaliaError("The transcription runtime does not list \(model). Recording is saved. Run `lalia-runtime setup`, then Retry.")
         }
     }
 
@@ -136,7 +159,7 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
 
     func notes(for transcript: String) async throws -> String {
         let config = try configuration.get()
-        var request = URLRequest(url: try config.endpoint("chat/completions"))
+        var request = URLRequest(url: try config.summaryEndpoint("chat/completions"))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try JSONSerialization.data(withJSONObject: [
@@ -148,7 +171,7 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
             "chat_template_kwargs": ["enable_thinking": false], "stream": false,
         ])
         let (data, response) = try await session.data(for: request)
-        try check(response)
+        try check(response, purpose: "notes service")
         struct Completion: Decodable {
             struct Choice: Decodable { struct Message: Decodable { var content: String }; var message: Message }
             var choices: [Choice]
@@ -160,10 +183,11 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
         return notes
     }
 
-    private func check(_ response: URLResponse) throws {
-        guard let response = response as? HTTPURLResponse else { throw LaliaError("Invalid oMLX HTTP response.") }
+    private func check(_ response: URLResponse, purpose: String = "local service") throws {
+        guard let response = response as? HTTPURLResponse else { throw LaliaError("Invalid \(purpose) HTTP response.") }
         guard (200..<300).contains(response.statusCode) else {
-            throw LaliaError("oMLX returned HTTP \(response.statusCode). Recordings are retained. Redirects are disabled.")
+            let detail = response.statusCode == 404 ? " The server may not support this API; update or configure a compatible local server." : ""
+            throw LaliaError("The \(purpose) returned HTTP \(response.statusCode).\(detail) Recordings are retained. Redirects are disabled.")
         }
     }
 
