@@ -4,6 +4,48 @@ import Testing
 @testable import Lalia
 
 struct SessionStoreTests {
+    @Test func deletesCompleteEntryWithoutTouchingOthers() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let selected = try savedAudio(store); let other = try savedAudio(store)
+        try store.update(selected.id) { $0.notes = "retained notes" }
+        for name in ["session-v1.backup.json", "previous-transcript.txt", "analysis.wav"] {
+            try store.write(Data(name.utf8), to: store.file(selected.id, name))
+        }
+        let export = store.root.appending(path: "export.txt")
+        try store.export(selected.id, to: export)
+        let exported = try Data(contentsOf: export)
+        let otherManifest = try Data(contentsOf: store.file(other.id, "session.json"))
+        try store.delete(selected.id)
+        #expect(!FileManager.default.fileExists(atPath: store.directory(selected.id).path))
+        #expect(try SessionStore(root: store.root).history().records.map(\.id) == [other.id])
+        #expect(try Data(contentsOf: export) == exported)
+        #expect(try Data(contentsOf: store.file(other.id, "session.json")) == otherManifest)
+    }
+
+    @Test func deletionRejectsLinkedSessionDirectory() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let selected = try savedAudio(store); let outside = TemporaryStore()
+        let target = try savedAudio(outside.store)
+        let manifest = try Data(contentsOf: outside.store.file(target.id, "session.json"))
+        try FileManager.default.removeItem(at: store.directory(selected.id))
+        try FileManager.default.createSymbolicLink(at: store.directory(selected.id), withDestinationURL: outside.store.directory(target.id))
+        #expect(throws: Error.self) { try store.delete(selected.id) }
+        #expect(try Data(contentsOf: outside.store.file(target.id, "session.json")) == manifest)
+        #expect(FileManager.default.fileExists(atPath: try outside.store.file(target.id, target.segments[0].filename).path))
+    }
+
+    @Test func deletionSurfacesFilesystemFailure() throws {
+        let fixture = TemporaryStore(); let store = fixture.store
+        let selected = try savedAudio(store)
+        let probe = store.root.appending(path: "removal-probe")
+        try Data().write(to: probe)
+        try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: store.root.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: store.root.path) }
+        #expect(throws: Error.self) { try FileManager.default.removeItem(at: probe) }
+        #expect(throws: Error.self) { try store.delete(selected.id) }
+        #expect(FileManager.default.fileExists(atPath: store.directory(selected.id).path))
+    }
+
     @Test func earlierLongAnalysisSurvivesReducedRecordingLimit() throws {
         let fixture = TemporaryStore(); let store = fixture.store
         let record = try savedAudio(store, seconds: 2)

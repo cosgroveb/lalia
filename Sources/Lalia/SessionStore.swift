@@ -118,6 +118,17 @@ final class SessionStore: @unchecked Sendable {
         return file
     }
 
+    func delete(_ id: UUID) throws {
+        lock.lock(); defer { lock.unlock() }
+        let directory = directory(id).standardizedFileURL
+        guard (try? manager.destinationOfSymbolicLink(atPath: directory.path)) == nil,
+              directory.resolvingSymlinksInPath().deletingLastPathComponent() == root.resolvingSymlinksInPath().standardizedFileURL,
+              try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+            throw LaliaError("Session deletion requires a directory inside the history store, not a symbolic link.")
+        }
+        try manager.removeItem(at: directory)
+    }
+
     func create(kind: SessionRecord.Kind) throws -> SessionRecord {
         lock.lock(); defer { lock.unlock() }
         let record = SessionRecord(id: UUID(), kind: kind, createdAt: Date())

@@ -3,7 +3,9 @@ import UniformTypeIdentifiers
 
 struct HistoryView: View {
     @ObservedObject var coordinator: DictationCoordinator
-    @State private var selection: UUID?
+    @State private var selection: Set<UUID> = []
+    @State private var pendingDeletion: Set<UUID>?
+    @State private var windowAnchor = NSView()
     @ObservedObject var playback: SessionPlayback
     var body: some View {
         NavigationSplitView {
@@ -14,8 +16,18 @@ struct HistoryView: View {
                         .font(.caption).foregroundStyle(.secondary)
                 }.tag(session.id)
             }
+            .onDeleteCommand(perform: requestDeletion)
         } detail: {
-            if let session = coordinator.sessions.first(where: { $0.id == selection }) {
+            if selection.count > 1 {
+                VStack(spacing: 12) {
+                    Text("\(selection.count) transcripts selected").font(.title2)
+                    Text("Select one transcript to view it.")
+                    if coordinator.sessions.contains(where: { selection.contains($0.id) && ($0.captureState == .recording || coordinator.processing[$0.id] != nil) }) {
+                        Text("Deletion is unavailable while a selected entry is recording or processing.")
+                            .foregroundStyle(.secondary)
+                    }
+                }.padding()
+            } else if let session = coordinator.sessions.first(where: { selection.contains($0.id) }) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 16) {
                         Text(session.createdAt.formatted()).font(.title2)
@@ -91,7 +103,13 @@ struct HistoryView: View {
                 }
             } else { Text("Select a transcript.") }
         }
-        .toolbar { RecordingButton(coordinator: coordinator) }
+        .background(HistoryWindowAnchor(view: windowAnchor))
+        .toolbar {
+            RecordingButton(coordinator: coordinator)
+            Button(action: requestDeletion) { Label("Delete", systemImage: "trash") }
+                .disabled(pendingDeletion != nil || !coordinator.canDeleteSessions(selection))
+        }
+        .onChange(of: coordinator.sessions.map(\.id)) { selection.formIntersection(coordinator.sessions.map(\.id)) }
         .onChange(of: selection) { playback.stop() }
         .onDisappear { playback.stop() }
         .safeAreaInset(edge: .bottom) {
@@ -101,6 +119,27 @@ struct HistoryView: View {
             }.font(.caption).frame(maxWidth: .infinity, alignment: .leading).padding()
         }
     }
+    private func requestDeletion() {
+        guard pendingDeletion == nil, coordinator.canDeleteSessions(selection),
+              let window = windowAnchor.window, window.attachedSheet == nil else { return }
+        let ids = selection
+        pendingDeletion = ids
+        let alert = HistoryDeletionConfirmation.makeAlert(count: ids.count)
+        alert.beginSheetModal(for: window) { response in
+            pendingDeletion = nil
+            guard response == .alertSecondButtonReturn else { return }
+            do { try coordinator.deleteSessions(ids) }
+            catch {
+                let failure = NSAlert()
+                failure.messageText = "Couldn’t delete transcripts"
+                failure.informativeText = error.localizedDescription
+                failure.addButton(withTitle: "OK")
+                failure.beginSheetModal(for: window)
+            }
+            selection.formIntersection(coordinator.sessions.map(\.id))
+        }
+    }
+
     private func export(_ session: SessionRecord) {
         let panel = NSSavePanel()
         panel.allowedContentTypes = [.plainText]
@@ -150,4 +189,10 @@ private struct SpeakerNameRow: View {
         .onChange(of: names[speaker]) { name = names[speaker] ?? "" }
     }
     private func rename() { coordinator.editTranscript(session) { try $0.rename(speaker, to: name) } }
+}
+
+private struct HistoryWindowAnchor: NSViewRepresentable {
+    let view: NSView
+    func makeNSView(context: Context) -> NSView { view }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }

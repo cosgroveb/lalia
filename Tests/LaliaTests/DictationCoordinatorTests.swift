@@ -5,6 +5,101 @@ import Testing
 @testable import Lalia
 
 @Suite(.serialized) @MainActor struct DictationCoordinatorTests {
+    @Test func deletionRejectsBusyOrMissingSelection() async throws {
+        let test = CoordinatorFixture(); let store = test.storage.store
+        let idle = try savedAudio(store); let failed = try savedAudio(store)
+        try store.update(failed.id) { $0.captureState = .failed }
+        let recording = try store.create(kind: .session)
+        test.coordinator.refreshHistory()
+        #expect(test.coordinator.canDeleteSessions([idle.id, failed.id]))
+        for ids: Set<UUID> in [[], [UUID()], [recording.id], [idle.id, recording.id]] {
+            #expect(!test.coordinator.canDeleteSessions(ids))
+            #expect(throws: Error.self) { try test.coordinator.deleteSessions(ids) }
+        }
+        test.transcriber.suspend = true
+        test.coordinator.retry(idle.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.coordinator.retry(failed.id)
+        #expect(test.coordinator.processing[failed.id] == "Queued")
+        for ids: Set<UUID> in [[idle.id], [failed.id], [idle.id, failed.id]] {
+            #expect(!test.coordinator.canDeleteSessions(ids))
+            #expect(throws: Error.self) { try test.coordinator.deleteSessions(ids) }
+        }
+        for id in [idle.id, failed.id, recording.id] { #expect(FileManager.default.fileExists(atPath: store.directory(id).path)) }
+        test.coordinator.cancelProcessing(failed.id)
+        test.transcriber.suspend = false; test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        await test.coordinator.shutdown()
+        #expect(!test.coordinator.canDeleteSessions([idle.id]))
+        #expect(throws: Error.self) { try test.coordinator.deleteSessions([idle.id]) }
+    }
+
+    @Test func deletionRechecksEligibility() async throws {
+        let test = CoordinatorFixture(); let store = test.storage.store
+        let first = try savedAudio(store); let second = try savedAudio(store)
+        let frozen: Set<UUID> = [first.id, second.id]
+        test.coordinator.refreshHistory()
+        #expect(test.coordinator.canDeleteSessions(frozen))
+        test.transcriber.suspend = true
+        test.coordinator.retry(first.id)
+        #expect(throws: Error.self) { try test.coordinator.deleteSessions(frozen) }
+        for id in frozen { #expect(FileManager.default.fileExists(atPath: store.directory(id).path)) }
+        while !test.transcriber.waiting { await Task.yield() }
+        test.transcriber.suspend = false; test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+    }
+
+    @Test func deletionRefreshesHistoryPlaybackAndLastTranscript() async throws {
+        let test = CoordinatorFixture(); let store = test.storage.store
+        let source = try savedAudio(store); let other = try savedAudio(store); let last = try savedAudio(store)
+        test.coordinator.retry(source.id)
+        await test.coordinator.waitForOperation()
+        let cached = try #require(test.coordinator.lastTranscript)
+        var stops = 0
+        test.playback.onStop = {
+            stops += 1
+            #expect(FileManager.default.fileExists(atPath: store.directory(other.id).path))
+        }
+        try test.coordinator.deleteSessions([other.id])
+        #expect(stops == 1)
+        #expect(test.coordinator.lastTranscript == cached)
+        #expect(Set(test.coordinator.sessions.map(\.id)) == [source.id, last.id])
+        test.playback.onStop = {
+            stops += 1
+            for id in [source.id, last.id] { #expect(FileManager.default.fileExists(atPath: store.directory(id).path)) }
+        }
+        try test.coordinator.deleteSessions([source.id, last.id])
+        #expect(stops == 2)
+        #expect(test.coordinator.lastTranscript == nil)
+        #expect(test.coordinator.sessions.isEmpty)
+        #expect(try SessionStore(root: store.root).history().records.isEmpty)
+    }
+
+    @Test func deletionStopsAtFirstFailure() throws {
+        let test = CoordinatorFixture(); let store = test.storage.store
+        let oldest = try savedAudio(store); let middle = try savedAudio(store); let newest = try savedAudio(store)
+        for (index, record) in [oldest, middle, newest].enumerated() {
+            try store.update(record.id) { $0.createdAt = Date(timeIntervalSince1970: Double(index)) }
+        }
+        test.coordinator.refreshHistory()
+        let retained = store.root.appending(path: "retained-middle")
+        try FileManager.default.moveItem(at: store.directory(middle.id), to: retained)
+        try FileManager.default.createSymbolicLink(at: store.directory(middle.id), withDestinationURL: retained)
+        do {
+            try test.coordinator.deleteSessions([oldest.id, middle.id, newest.id])
+            Issue.record("Expected deletion failure")
+        } catch {
+            #expect(error.localizedDescription.contains(middle.id.uuidString))
+            #expect(error.localizedDescription.contains("1 entry deleted"))
+            #expect(error.localizedDescription.contains("Remaining entries were not attempted"))
+        }
+        #expect(!FileManager.default.fileExists(atPath: store.directory(newest.id).path))
+        #expect(FileManager.default.fileExists(atPath: store.directory(middle.id).path))
+        #expect(FileManager.default.fileExists(atPath: store.directory(oldest.id).path))
+        #expect(test.coordinator.sessions.map(\.id) == [oldest.id])
+        #expect(!test.coordinator.diagnostics.isEmpty)
+    }
+
     @Test func transcriptionAllowsNewCaptureAndDoesNotChangeItsPhase() async throws {
         for session in [false, true] {
             let test = CoordinatorFixture(); let saved = try savedAudio(test.storage.store)

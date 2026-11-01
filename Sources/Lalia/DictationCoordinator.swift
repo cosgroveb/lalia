@@ -57,6 +57,33 @@ import Foundation
     var available: Bool { !quitting && sessionUsable && (phase == .idle || phase == .needsPermission) }
     var canCancel: Bool { currentJob != nil }
     func canProcess(_ id: UUID) -> Bool { !quitting && id != activeSession && processing[id] == nil }
+    func canDeleteSessions(_ ids: Set<UUID>) -> Bool {
+        !quitting && !ids.isEmpty && ids.allSatisfy { id in
+            id != activeSession && processing[id] == nil
+                && sessions.contains { $0.id == id && $0.captureState != .recording }
+        }
+    }
+
+    func deleteSessions(_ ids: Set<UUID>) throws {
+        guard canDeleteSessions(ids) else {
+            throw LaliaError("Select existing entries that are not recording, queued, or processing before deleting.")
+        }
+        playback.stop()
+        defer { refreshHistory() }
+        var deleted = 0
+        for session in sessions where ids.contains(session.id) {
+            do { try store.delete(session.id) }
+            catch {
+                throw LaliaError("Couldn’t delete the transcript from \(session.createdAt.formatted()) (\(session.id)): \(error.localizedDescription) \(deleted) \(deleted == 1 ? "entry deleted" : "entries deleted"). Remaining entries were not attempted. The failed entry may have been partially removed.")
+            }
+            deleted += 1
+            if lastTranscriptSession == session.id {
+                lastTranscript = nil
+                lastTranscriptSession = nil
+            }
+        }
+    }
+
     private func notifyCaptureAvailability() {
         let captureActive = phase == .preparing || phase == .recording || phase == .recordingSession || phase == .stopping
         onCaptureAvailabilityChanged?(canBeginGestureCapture, captureActive)
