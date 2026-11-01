@@ -35,8 +35,9 @@ is missing:
   Sessions stop at 60 minutes. Use headphones to reduce playback leaking into
   the microphone.
 
-Speaker labels are experimental. MOSS can omit speech or invent text and speaker
-labels. Review transcripts against the saved audio.
+Lalia transcription is produced by a Large Audio Language Model. MOSS can omit
+speech or invent text and speaker labels. Review transcripts against the saved
+audio.
 
 Open `Transcript History` to play audio, copy or export transcripts, correct
 speaker labels, or retry failed transcription. You can record while earlier
