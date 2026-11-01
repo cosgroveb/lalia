@@ -3,7 +3,7 @@ import Foundation
 
 @MainActor final class DictationCoordinator: ObservableObject {
     @Published private(set) var phase: Phase = .needsPermission { didSet { notifyCaptureAvailability() } }
-    @Published private(set) var message = "Enable dictation and gestures to get started."
+    @Published private(set) var message = "Enable dictation to get started."
     @Published private(set) var lastTranscript: String?
     @Published private(set) var gestureAvailable = false { didSet { notifyCaptureAvailability() } }
     @Published private(set) var gestureMessage: String?
@@ -35,17 +35,26 @@ import Foundation
     private var captureGeneration = UUID()
     private var quitting = false
     private var startingFailure: Error?
+    private var endingReason: SessionInterruption?
+    private var pendingNotice: SessionInterruptionNotice?
+    @Published private(set) var sessionUsable = true
+    var onInterruptionNotice: (() -> Void)?
     private var recordingActivity: RecordingActivity?
     private var deadline: Task<Void, Never>?
     let recordingLimit: Double
     private let warningSeconds: Double
     var onCaptureAvailabilityChanged: (@MainActor (Bool, Bool) -> Void)? { didSet { notifyCaptureAvailability() } }
-    private var readyMessage: String { gestureAvailable ? "Ready. Hold Right Option to dictate." : "Dictation is ready. Enable Gestures to use Right Option." }
+    private var readyMessage: String { gestureAvailable ? "Ready. Hold Right Option to dictate." : "Dictation is ready. Keyboard shortcuts are unavailable." }
+    var shortcutStatus: String {
+        if gestureAvailable { return phase == .recordingSession ? "Transcribing." : "Keyboard shortcuts available." }
+        let reason = gestureMessage ?? "Keyboard shortcuts unavailable."
+        return phase == .recordingSession ? reason + " Transcribing continues. Use Stop Transcribing in the menu." : reason
+    }
     private var canBeginGestureCapture: Bool {
-        gestureAvailable && phase == .idle && authorizer.currentStatus().microphoneGranted && !quitting
+        sessionUsable && gestureAvailable && phase == .idle && authorizer.currentStatus().microphoneGranted && !quitting
     }
     var recordingRemaining: Double { max(0, recordingLimit - recordingElapsed) }
-    var available: Bool { !quitting && (phase == .idle || phase == .needsPermission) }
+    var available: Bool { !quitting && sessionUsable && (phase == .idle || phase == .needsPermission) }
     var canCancel: Bool { currentJob != nil }
     func canProcess(_ id: UUID) -> Bool { !quitting && id != activeSession && processing[id] == nil }
     private func notifyCaptureAvailability() {
@@ -139,14 +148,33 @@ import Foundation
         else if available { startSession() }
     }
     func gestureListenerLost() {
+        interrupt(.keyboardUnavailable)
+    }
+    func setSessionUsable(_ usable: Bool) {
+        sessionUsable = usable
+        notifyCaptureAvailability()
+        if usable { startNextProcessing(); onInterruptionNotice?() }
+    }
+    func takeInterruptionNotice() -> SessionInterruptionNotice? {
+        guard sessionUsable, !quitting, activeSession == nil, phase != .preparing, phase != .stopping else { return nil }
+        defer { pendingNotice = nil }
+        return pendingNotice
+    }
+    func interrupt(_ reason: SessionInterruption) {
         if phase == .recording, let id = gestureDictation { gestureCancelled(id) }
-        if phase == .recordingSession {
-            phase = .stopping
-            captureOperation = Task {
-                await finishSession(transcribe: false, failure: LaliaError("Gesture monitoring was lost. Audio was saved without analysis; use Retry to transcribe."))
+        guard reason.endsSession else { return }
+        guard phase == .preparing || phase == .recordingSession || phase == .stopping else {
+            if let notice = pendingNotice {
+                let merged = notice.reason.merging(reason)
+                pendingNotice = merged.noticeTitle == nil ? nil : SessionInterruptionNotice(id: notice.id, reason: merged)
             }
+            return
         }
-        else if phase == .preparing { captureGeneration = UUID(); captureOperation?.cancel() }
+        endingReason = endingReason.map { $0.merging(reason) } ?? reason
+        captureGeneration = UUID()
+        if phase == .preparing || phase == .stopping { return }
+        phase = .stopping
+        captureOperation = Task { await finishSession() }
     }
     private func finishDictation(transcribe: Bool) {
         guard let id = activeSession, let segment = dictationSegment else { return }
@@ -164,10 +192,12 @@ import Foundation
         refreshHistory()
     }
     func startSession() {
-        guard gestureAvailable, available else { return }
+        guard available else { return }
+        pendingNotice = nil
+        endingReason = nil
         captureGeneration = UUID()
         let generation = captureGeneration
-        phase = .preparing; message = "Starting microphone and Mac audio…"
+        phase = .preparing; message = "Starting transcription…"
         startingFailure = nil
         captureOperation = Task {
             guard await authorizer.requestMicrophone() else {
@@ -175,6 +205,7 @@ import Foundation
             }
             do {
                 try Task.checkCancellation()
+                guard generation == captureGeneration, !quitting, sessionUsable else { phase = .idle; return }
                 let session = try store.create(kind: .session)
                 try store.update(session.id) { $0.analysis = SessionAnalysis() }
                 activeSession = session.id
@@ -182,32 +213,33 @@ import Foundation
                 playback.stop()
                 let started = ContinuousClock.now
                 try await capture.start(session: session.id, store: store, maximumDuration: recordingLimit) { [weak self] error in
-                    self?.captureFailed(error)
+                    self?.captureFailed(error, session: session.id)
                 }
                 guard generation == captureGeneration, !quitting else {
                     phase = .stopping
-                    await finishSession(transcribe: false)
+                    await finishSession()
                     return
                 }
                 if let startingFailure {
                     phase = .stopping
-                    await finishSession(transcribe: false, failure: startingFailure)
+                    await finishSession(failure: startingFailure)
                 } else {
-                    phase = .recordingSession; message = "Recording microphone and Mac audio…"
+                    phase = .recordingSession; message = "Transcribing microphone and Mac audio…"
                     startDeadline(at: started)
                 }
             } catch {
-                recordingActivity = nil
-                recordCaptureFailure(error)
-                activeSession = nil; phase = .idle
+                if activeSession != nil {
+                    phase = .stopping
+                    await finishSession(failure: error)
+                } else { phase = .idle; message = error.localizedDescription }
             }
             refreshHistory()
         }
     }
     func stopSession() {
         guard phase == .recordingSession else { return }
-        phase = .stopping; message = "Saving recording…"
-        captureOperation = Task { await finishSession(transcribe: true) }
+        message = "Preparing your transcript…"
+        interrupt(.stop)
     }
     private func startDeadline(at start: ContinuousClock.Instant) {
         deadline?.cancel()
@@ -223,10 +255,10 @@ import Foundation
                         do { try self.store.update(id) { $0.endedAtLimit = true } }
                         catch { self.message = "Could not save recording limit status: \(error.localizedDescription)" }
                     }
-                    self.stopSession()
+                    self.interrupt(.limit)
                     return
                 }
-                if self.recordingWarning { self.message = "Recording ends in \(SessionRecord.timestamp(self.recordingRemaining))." }
+                if self.recordingWarning { self.message = "Transcribing stops in \(SessionRecord.timestamp(self.recordingRemaining))." }
                 let next = self.recordingWarning ? self.recordingRemaining : self.recordingRemaining - self.warningSeconds
                 do { try await Task.sleep(for: .seconds(min(1, max(0.001, next)))) }
                 catch { return }
@@ -237,33 +269,62 @@ import Foundation
         if phase == .recordingSession { stopSession() }
         else { startSession() }
     }
-    private func captureFailed(_ error: Error) {
-        guard activeSession != nil, phase == .recordingSession || phase == .preparing else { return }
-        if phase == .preparing { startingFailure = error; return }
-        phase = .stopping
-        captureOperation = Task { await finishSession(transcribe: false, failure: error) }
+    private func captureFailed(_ error: Error, session: UUID) {
+        guard activeSession == session, phase == .recordingSession || phase == .preparing || phase == .stopping else { return }
+        startingFailure = CaptureFailure.preferred(startingFailure, error)
+        interrupt((error as? CaptureFailure)?.interruption ?? .captureFailure)
     }
-    private func finishSession(transcribe: Bool, failure: Error? = nil) async {
+    private func finishSession(failure initialFailure: Error? = nil) async {
         guard let id = activeSession else { return }
         deadline?.cancel(); deadline = nil
-        var failure = failure
-        do { try await capture.stop() } catch { if failure == nil { failure = error } }
+        var failure = startingFailure
+        if let initialFailure { failure = CaptureFailure.preferred(failure, initialFailure) }
+        if let failure {
+            let cause = (failure as? CaptureFailure)?.interruption ?? .captureFailure
+            endingReason = endingReason.map { $0.merging(cause) } ?? cause
+        }
+        do { try await capture.stop() }
+        catch {
+            failure = CaptureFailure.preferred(failure, error)
+            let cause = (error as? CaptureFailure)?.interruption ?? .captureFailure
+            endingReason = endingReason.map { $0.merging(cause) } ?? cause
+        }
+        if let startingFailure { failure = CaptureFailure.preferred(failure, startingFailure) }
         recordingActivity = nil
-        if let failure { recordCaptureFailure(failure) }
+        let reason = quitting ? .quit : (endingReason ?? .stop)
+        if let failure {
+            if !recordCaptureFailure(failure) { endingReason = .storageFailure }
+        }
         else {
             do { try store.update(id) { $0.captureState = .complete } }
-            catch { failure = error; recordCaptureFailure(error) }
+            catch { failure = error; endingReason = .storageFailure; recordCaptureFailure(error) }
+        }
+        var finalReason = endingReason == .storageFailure ? .storageFailure : reason
+        if finalReason.allowsPartialTranscript {
+            do {
+                try store.update(id) {
+                    if $0.analysis == nil { $0.analysis = SessionAnalysis() }
+                    $0.analysis?.allowsIncompleteInput = true
+                }
+            } catch {
+                finalReason = .storageFailure
+                recordCaptureFailure(error)
+            }
         }
         activeSession = nil; phase = .idle
+        startingFailure = nil; endingReason = nil
+        if finalReason.noticeTitle != nil { pendingNotice = SessionInterruptionNotice(id: id, reason: finalReason) }
         refreshHistory()
-        if failure == nil, transcribe { beginAnalysis(id, reprocess: false) }
+        if finalReason.attemptsTranscription { beginAnalysis(id, reprocess: false) }
+        if pendingNotice != nil { onInterruptionNotice?() }
     }
-    private func recordCaptureFailure(_ error: Error) {
+    @discardableResult private func recordCaptureFailure(_ error: Error) -> Bool {
         message = "Capture failed: \(error.localizedDescription) Saved audio is retained."
         if let id = activeSession {
             do { try store.update(id) { $0.captureState = .failed; $0.captureError = error.localizedDescription } }
-            catch { message += " Could not save status: \(error.localizedDescription)" }
+            catch { message += " Could not save status: \(error.localizedDescription)"; return false }
         }
+        return true
     }
     func retry(_ id: UUID) {
         guard canProcess(id) else { return }
@@ -278,7 +339,7 @@ import Foundation
         enqueue(id, work: .analysis(reprocess: reprocess))
     }
     private func analyzeSession(_ id: UUID, reprocess: Bool) async {
-        processingMessage("Preparing conversation audio…", for: id)
+        processingMessage("Preparing your transcript…", for: id)
         let activity = ProcessInfo.processInfo.beginActivity(options: [.idleSystemSleepDisabled], reason: "Lalia analysis \(id)")
         defer { ProcessInfo.processInfo.endActivity(activity); refreshHistory() }
         do {
@@ -288,6 +349,7 @@ import Foundation
                 processingMessage("Transcript already saved. Use Reprocess to replace it.", for: id); return
             }
             let profile = try (!reprocess ? record.analysis?.attempt?.profile : nil) ?? transcriber.sessionProfile()
+            let allowIncomplete = record.analysis?.allowsIncompleteInput == true
             let attempt = SessionAnalysis.Attempt(profile: profile)
             try store.update(id) { record in
                 if record.analysis == nil { record.analysis = SessionAnalysis() }
@@ -295,7 +357,7 @@ import Foundation
                 record.transcriptionError = nil
             }
             let store = store
-            let preparation = Task.detached { try SessionAudioPreparer().prepare(session: id, store: store) }
+            let preparation = Task.detached { try SessionAudioPreparer().prepare(session: id, store: store, allowIncomplete: allowIncomplete) }
             let input = try await withTaskCancellationHandler { try await preparation.value } onCancel: { preparation.cancel() }
             try Task.checkCancellation()
             var accepted: SpeakerTranscript
@@ -303,7 +365,7 @@ import Foundation
             else {
                 try await transcriber.prepareSession(profile: profile)
                 try Task.checkCancellation()
-                processingMessage("Transcribing conversation with speaker labels…", for: id)
+                processingMessage("Preparing your transcript…", for: id)
                 try store.update(id) { $0.analysis?.attempt?.state = .running }
                 let raw = try await transcriber.transcribeSession(store.file(id, input.filename), profile: profile)
                 // Save even a rejected response before interpreting model output.
@@ -313,6 +375,7 @@ import Foundation
                 guard let saved = record.analysis?.attempt else { throw LaliaError("Missing analysis attempt.") }
                 accepted = try SpeakerTranscript(attempt: saved, duration: input.duration)
             }
+            accepted.incomplete = input.incomplete
             try Task.checkCancellation()
             processingMessage("Saving speaker transcript…", for: id)
             try store.update(id) { record in
@@ -324,9 +387,9 @@ import Foundation
                 record.analysis?.attempt?.state = .complete
                 record.analysis?.attempt?.error = nil
             }
-            lastTranscript = trimmedTranscript(accepted.transcript)
+            lastTranscript = trimmedTranscript(try store.read(id).plainTranscript)
             lastTranscriptSession = id
-            processingMessage(accepted.turns.isEmpty ? "No speech recognized." : "Speaker transcript saved.", for: id)
+            processingMessage(accepted.turns.isEmpty ? "No speech recognized." : "Transcript ready.", for: id)
         } catch {
             let failure = Task.isCancelled ? "Processing cancelled. Audio and previous transcript are retained. oMLX may still be processing; Retry may wait for that request." : error.localizedDescription
             processingMessage(failure, for: id)
@@ -385,7 +448,7 @@ import Foundation
             lastTranscriptSession = id
             if paste {
                 guard generation == captureGeneration, available else {
-                    processingMessage("Dictation saved. Use Copy Last Transcript or Recording History.", for: id); return
+                    processingMessage("Dictation saved. Use Copy Last Transcript or Transcript History.", for: id); return
                 }
                 guard authorizer.currentStatus().accessibilityGranted else { processingMessage("Accessibility permission is required to paste.", for: id); return }
                 processingMessage("Pasting…", for: id)
@@ -431,7 +494,7 @@ import Foundation
         startNextProcessing()
     }
     private func startNextProcessing() {
-        guard !quitting, currentJob == nil, !queue.isEmpty else { return }
+        guard !quitting, sessionUsable, currentJob == nil, !queue.isEmpty else { return }
         let job = queue.removeFirst()
         currentJob = job
         processingOperation = Task {
@@ -470,10 +533,13 @@ import Foundation
     }
     func shutdown() async {
         quitting = true
+        endingReason = .quit
+        pendingNotice = nil
+        captureGeneration = UUID()
         deadline?.cancel(); deadline = nil
         if phase == .preparing { await captureOperation?.value }
         if phase == .recording { finishDictation(transcribe: false) }
-        if phase == .recordingSession { phase = .stopping; await finishSession(transcribe: false) }
+        if phase == .recordingSession { phase = .stopping; await finishSession() }
         captureOperation?.cancel()
         await captureOperation?.value
         for job in queue { cancelProcessing(job.session) }

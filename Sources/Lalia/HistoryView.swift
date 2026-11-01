@@ -21,7 +21,7 @@ struct HistoryView: View {
                         Text(session.createdAt.formatted()).font(.title2)
                         if let error = session.captureError { Text(error).foregroundStyle(.red) }
                         if let error = session.transcriptionError { Text(error).foregroundStyle(.red) }
-                        if session.endedAtLimit == true { Text("Recording stopped at the 60-minute limit.").foregroundStyle(.secondary) }
+                        if session.endedAtLimit == true { Text("Transcribing stopped at the 60-minute limit.").foregroundStyle(.secondary) }
                         if let status = coordinator.processing[session.id] {
                             Text(status).foregroundStyle(.secondary)
                             Button("Cancel Processing") { coordinator.cancelProcessing(session.id) }
@@ -89,7 +89,7 @@ struct HistoryView: View {
                         if let notes = session.notes { Text("Generated notes").font(.headline); Text(notes).textSelection(.enabled) }
                     }.frame(maxWidth: .infinity, alignment: .leading).padding()
                 }
-            } else { Text("Select a recording.") }
+            } else { Text("Select a transcript.") }
         }
         .toolbar { RecordingButton(coordinator: coordinator) }
         .onChange(of: selection) { playback.stop() }

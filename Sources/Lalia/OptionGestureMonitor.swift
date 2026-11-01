@@ -64,6 +64,15 @@ struct OptionGestureListenerState {
     }
 }
 
+struct GestureRecoveryBackoff {
+    private var delay = 0.5
+    mutating func next() -> TimeInterval {
+        defer { delay = min(8, delay * 2) }
+        return delay
+    }
+    mutating func reset() { delay = 0.5 }
+}
+
 @MainActor final class OptionGestureMonitor {
     static let observedEventTypes: [CGEventType] = [
         .flagsChanged, .keyDown, .keyUp, .leftMouseDown, .rightMouseDown, .otherMouseDown,
@@ -84,7 +93,37 @@ struct OptionGestureListenerState {
     private var source: CFRunLoopSource?
     private var timer: Timer?
     private var holdTimer: Timer?
-    private var observers: [NSObjectProtocol] = []
+    private var recoveryTimer: Timer?
+    private var backoff = GestureRecoveryBackoff()
+    private(set) var isMonitoring = false
+    var hasRecoveryTimer: Bool { recoveryTimer != nil }
+    private var sessionUsable = true
+    private let permission: () -> Bool
+    private let secureInput: () -> Bool
+    private let requestAccess: () -> Void
+
+    private let createTap: @MainActor (UnsafeMutableRawPointer) -> CFMachPort?
+    private let enableTap: (CFMachPort) -> Void
+    private let tapIsEnabled: (CFMachPort) -> Bool
+    private let makeTimer: (TimeInterval, Bool, @escaping @Sendable (Timer) -> Void) -> Timer
+    private let physicalSnapshot: (() -> (options: Set<OptionSide>, keys: Set<UInt16>))?
+
+    init(permission: @escaping () -> Bool = { CGPreflightListenEventAccess() },
+         secureInput: @escaping () -> Bool = { IsSecureEventInputEnabled() },
+         requestAccess: @escaping () -> Void = { _ = CGRequestListenEventAccess() },
+         createTap: @escaping @MainActor (UnsafeMutableRawPointer) -> CFMachPort? = OptionGestureMonitor.createNativeTap,
+         enableTap: @escaping (CFMachPort) -> Void = { CGEvent.tapEnable(tap: $0, enable: true) },
+         tapIsEnabled: @escaping (CFMachPort) -> Bool = { CGEvent.tapIsEnabled(tap: $0) },
+         makeTimer: @escaping (TimeInterval, Bool, @escaping @Sendable (Timer) -> Void) -> Timer = { delay, repeats, callback in
+             let timer = Timer(timeInterval: delay, repeats: repeats, block: callback)
+             RunLoop.main.add(timer, forMode: .common)
+             return timer
+         },
+         physicalSnapshot: (() -> (options: Set<OptionSide>, keys: Set<UInt16>))? = nil) {
+        self.permission = permission; self.secureInput = secureInput; self.requestAccess = requestAccess
+        self.createTap = createTap; self.enableTap = enableTap; self.tapIsEnabled = tapIsEnabled
+        self.makeTimer = makeTimer; self.physicalSnapshot = physicalSnapshot
+    }
     private var listener = OptionGestureListenerState()
     private lazy var actionDelivery = GestureActionDelivery(
         isHealthy: { [weak self] in self?.isListenerHealthy ?? false },
@@ -96,7 +135,7 @@ struct OptionGestureListenerState {
     private var eventTime: TimeInterval { ProcessInfo.processInfo.systemUptime }
     private var isListenerHealthy: Bool {
         guard enabled, let tap else { return false }
-        return Self.healthFailure(permission: CGPreflightListenEventAccess(), secureInput: IsSecureEventInputEnabled(), tapEnabled: CGEvent.tapIsEnabled(tap: tap)) == nil
+        return Self.healthFailure(permission: permission(), secureInput: secureInput(), tapEnabled: tapIsEnabled(tap)) == nil
     }
 
     static func normalizedInputs(for event: CGEvent, type: CGEventType, at suppliedTime: TimeInterval? = nil) -> [GestureInput] {
@@ -136,45 +175,66 @@ struct OptionGestureListenerState {
     }
 
     func start(requestPermission: Bool = false) {
-        if requestPermission { _ = CGRequestListenEventAccess() }
-        guard CGPreflightListenEventAccess() else {
-            setAvailable(false, "Input Monitoring is off."); return
-        }
-        guard !IsSecureEventInputEnabled() else {
-            setAvailable(false, "Secure input is active."); return
-        }
+        if requestPermission { requestAccess() }
+        isMonitoring = true
+        guard sessionUsable else { return }
         guard tap == nil else { checkHealth(); return }
-        let mask = Self.observedEventTypes.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
-        guard let created = CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
-                                              options: .listenOnly, eventsOfInterest: CGEventMask(mask),
-                                              callback: optionGestureTapCallback,
-                                              userInfo: Unmanaged.passUnretained(self).toOpaque()) else {
-            setAvailable(false, "Gesture listener unavailable."); return
+        guard recoveryTimer == nil else { return }
+        connect()
+    }
+
+    func setSessionUsable(_ usable: Bool) {
+        sessionUsable = usable
+        guard isMonitoring else { return }
+        if usable {
+            backoff.reset()
+            start()
+        } else {
+            recoveryTimer?.invalidate(); recoveryTimer = nil
+            actionDelivery.invalidate()
+            tearDownTap()
+            apply(listener.lose("Keyboard shortcuts are paused."))
+        }
+    }
+
+    private static func createNativeTap(_ userInfo: UnsafeMutableRawPointer) -> CFMachPort? {
+        let mask = observedEventTypes.reduce(CGEventMask(0)) { $0 | (1 << $1.rawValue) }
+        return CGEvent.tapCreate(tap: .cgSessionEventTap, place: .headInsertEventTap,
+                                 options: .listenOnly, eventsOfInterest: mask,
+                                 callback: optionGestureTapCallback, userInfo: userInfo)
+    }
+
+    private func connect() {
+        guard isMonitoring, sessionUsable, tap == nil else { return }
+        guard permission() else {
+            setAvailable(false, "Allow Input Monitoring for Lalia in System Settings.")
+            scheduleRecovery(); return
+        }
+        guard !secureInput() else {
+            setAvailable(false, "Keyboard shortcuts are unavailable during secure input.")
+            scheduleRecovery(); return
+        }
+        guard let created = createTap(Unmanaged.passUnretained(self).toOpaque()) else {
+            setAvailable(false, "Keyboard shortcuts are unavailable. Retrying…"); scheduleRecovery(); return
         }
         tap = created
         source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, created, 0)
         if let source { CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes) }
-        CGEvent.tapEnable(tap: created, enable: true)
+        enableTap(created)
         enabled = true
-        timer = Timer(timeInterval: OptionGestureRecognizer.stateCheckInterval, repeats: true) { [weak self] _ in
+        timer = makeTimer(OptionGestureRecognizer.stateCheckInterval, true) { [weak self] _ in
             MainActor.assumeIsolated { self?.checkHealth() }
         }
-        if let timer { RunLoop.main.add(timer, forMode: .common) }
-        let center = NSWorkspace.shared.notificationCenter
-        for name in [NSWorkspace.willSleepNotification, NSWorkspace.sessionDidResignActiveNotification] {
-            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                MainActor.assumeIsolated { self?.loseListener("Gestures paused.") }
-            })
-        }
-        observers.append(center.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.loseListener("Gestures paused.") }
-        })
+        backoff.reset()
         setAvailable(true, nil)
     }
 
     func stop() {
+        isMonitoring = false
+        recoveryTimer?.invalidate(); recoveryTimer = nil
+        backoff.reset()
         actionDelivery.invalidate()
-        tearDown()
+        tearDownTap()
         apply(listener.lose("Gesture listening stopped."))
     }
 
@@ -183,22 +243,32 @@ struct OptionGestureListenerState {
         scheduleHoldTimer()
     }
 
-    private func tearDown() {
+    private func scheduleRecovery() {
+        guard isMonitoring, sessionUsable, recoveryTimer == nil else { return }
+        let timer = makeTimer(backoff.next(), false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.recoveryTimer = nil
+                self.connect()
+            }
+        }
+        recoveryTimer = timer
+    }
+
+    private func tearDownTap() {
         timer?.invalidate(); timer = nil
         holdTimer?.invalidate(); holdTimer = nil
-        for observer in observers { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
-        observers.removeAll()
         if let source { CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes) }
         if let tap { CFMachPortInvalidate(tap) }
         source = nil; tap = nil; enabled = false
     }
 
-    fileprivate func receive(_ event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
+    func receive(_ event: CGEvent, type: CGEventType) -> Unmanaged<CGEvent>? {
         guard enabled, let tap else {
             loseListener("Gesture listener unavailable.")
             return Unmanaged.passUnretained(event)
         }
-        if let failure = Self.healthFailure(permission: CGPreflightListenEventAccess(), secureInput: IsSecureEventInputEnabled(), tapEnabled: CGEvent.tapIsEnabled(tap: tap)) {
+        if let failure = Self.healthFailure(permission: permission(), secureInput: secureInput(), tapEnabled: tapIsEnabled(tap)) {
             loseListener(failure)
             return Unmanaged.passUnretained(event)
         }
@@ -214,6 +284,7 @@ struct OptionGestureListenerState {
     }
 
     private func physicalState() -> (options: Set<OptionSide>, keys: Set<UInt16>) {
+        if let physicalSnapshot { return physicalSnapshot() }
         let heldOptions = Self.optionSides(in: CGEventSource.flagsState(.combinedSessionState).rawValue)
         var heldKeys = physicalOtherKeys()
         heldKeys.formUnion((0..<5).compactMap { index in
@@ -228,7 +299,7 @@ struct OptionGestureListenerState {
         guard let tap else {
             loseListener("Gesture listener unavailable."); return
         }
-        if let failure = Self.healthFailure(permission: CGPreflightListenEventAccess(), secureInput: IsSecureEventInputEnabled(), tapEnabled: CGEvent.tapIsEnabled(tap: tap)) {
+        if let failure = Self.healthFailure(permission: permission(), secureInput: secureInput(), tapEnabled: tapIsEnabled(tap)) {
             loseListener(failure); return
         }
         let actual = physicalState()
@@ -242,7 +313,7 @@ struct OptionGestureListenerState {
         holdTimer?.invalidate(); holdTimer = nil
         guard let deadline = listener.holdDeadline else { return }
         let delay = max(0, deadline - eventTime)
-        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+        let timer = makeTimer(delay, false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self else { return }
                 self.checkHealth()
@@ -252,7 +323,6 @@ struct OptionGestureListenerState {
             }
         }
         holdTimer = timer
-        RunLoop.main.add(timer, forMode: .common)
     }
 
     private func keyDown(_ code: Int64) -> Bool { CGEventSource.keyState(.combinedSessionState, key: CGKeyCode(code)) }
@@ -296,9 +366,10 @@ struct OptionGestureListenerState {
 
     private func handleListenerLoss(_ transition: OptionGestureListenerTransition) {
         actionDelivery.invalidate()
-        tearDown()
+        tearDownTap()
         lastHealthy = false
         apply(transition)
+        scheduleRecovery()
     }
 
     private func setAvailable(_ value: Bool, _ message: String?) {

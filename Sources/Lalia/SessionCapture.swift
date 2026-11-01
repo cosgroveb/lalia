@@ -1,5 +1,6 @@
 import AVFoundation
 import CoreMedia
+import CoreGraphics
 import ScreenCaptureKit
 
 // Used only on the serial capture queue (and synchronously with synthetic test buffers).
@@ -39,14 +40,16 @@ final class SourceAudioWriter {
                 let segment = AudioSegment(id: id, source: source, filename: "\(source.rawValue)-\(id).caf",
                                            start: start + Double(offset) / buffer.format.sampleRate,
                                            sampleRate: buffer.format.sampleRate, channels: buffer.format.channelCount)
-                try store.update(session) { $0.segments.append(segment) }
-                let url = try store.file(session, segment.partialFilename)
-                try store.privateFile(url)
-                var settings = buffer.format.settings
-                settings[AVLinearPCMIsNonInterleaved] = false
-                let file = try AVAudioFile(forWriting: url, settings: settings,
-                                           commonFormat: buffer.format.commonFormat, interleaved: buffer.format.isInterleaved)
-                tracks[source] = Track(segment: segment, file: file, format: buffer.format)
+                do {
+                    try store.update(session) { $0.segments.append(segment) }
+                    let url = try store.file(session, segment.partialFilename)
+                    try store.privateFile(url)
+                    var settings = buffer.format.settings
+                    settings[AVLinearPCMIsNonInterleaved] = false
+                    let file = try AVAudioFile(forWriting: url, settings: settings,
+                                               commonFormat: buffer.format.commonFormat, interleaved: buffer.format.isInterleaved)
+                    tracks[source] = Track(segment: segment, file: file, format: buffer.format)
+                } catch { throw CaptureFailure(kind: .storage, underlying: error) }
             }
             guard var track = tracks[source], let file = track.file else { throw LaliaError("Capture file is unavailable.") }
             let room = Int64((rotation * buffer.format.sampleRate).rounded()) - track.frames
@@ -54,7 +57,8 @@ final class SourceAudioWriter {
             guard remaining > 0 else { break }
             let count = AVAudioFrameCount(min(length - Int64(offset), room, remaining))
             let part = try Self.slice(buffer, offset: offset, count: count)
-            try file.write(from: part)
+            do { try file.write(from: part) }
+            catch { throw CaptureFailure(kind: .storage, underlying: error) }
             track.frames += Int64(count)
             tracks[source] = track
             offset += count
@@ -65,7 +69,8 @@ final class SourceAudioWriter {
     func finish() throws {
         var firstError: Error?
         for source in AudioSource.allCases {
-            do { try finish(source) } catch { if firstError == nil { firstError = error } }
+            do { try finish(source) }
+            catch { if firstError == nil || (error as? CaptureFailure)?.kind == .storage { firstError = error } }
         }
         if let firstError { throw firstError }
     }
@@ -91,7 +96,7 @@ final class SourceAudioWriter {
     }
 }
 
-private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
+final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked Sendable {
     let queue = DispatchQueue(label: "com.bcosgrove.Lalia.audio")
     private let writer: SourceAudioWriter
     private let failed: @MainActor @Sendable (Error) -> Void
@@ -112,9 +117,18 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
             guard status == noErr else { throw LaliaError("Cannot copy captured audio (\(status)).") }
             try writer.append(buffer, source: outputType == .audio ? .system : .microphone,
                               timestamp: sampleBuffer.presentationTimeStamp.seconds)
-        } catch { fail(error) }
+        } catch { fail(error as? CaptureFailure ?? CaptureFailure(kind: .stream, underlying: error)) }
     }
-    func stream(_ stream: SCStream, didStopWithError error: Error) { queue.async { self.fail(error) } }
+    func stream(_ stream: SCStream, didStopWithError error: Error) { queue.async { self.fail(Self.classifyStreamError(error)) } }
+    static func classifyStreamError(_ error: Error) -> CaptureFailure {
+        let native = error as NSError
+        let authorization = AVCaptureDevice.authorizationStatus(for: .audio)
+        let permission = authorization == .denied || authorization == .restricted || !CGPreflightScreenCaptureAccess() || (native.domain == SCStreamErrorDomain && [
+            SCStreamError.Code.userDeclined.rawValue, SCStreamError.Code.missingEntitlements.rawValue,
+            SCStreamError.Code.userStopped.rawValue
+        ].contains(native.code))
+        return CaptureFailure(kind: permission ? .permission : .stream, underlying: error)
+    }
     private func fail(_ error: Error) {
         guard !stopped else { return }
         stopped = true
@@ -125,7 +139,7 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
             queue.async {
                 self.stopped = true
                 do { try self.writer.finish(); continuation.resume() }
-                catch { continuation.resume(throwing: error) }
+                catch { continuation.resume(throwing: error as? CaptureFailure ?? CaptureFailure(kind: .stream, underlying: error)) }
             }
         }
     }
@@ -134,13 +148,50 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
 @MainActor final class SessionCapture: SessionCapturing {
     private var stream: SCStream?
     private var output: CaptureOutput?
+    private var microphoneObserver: NSObjectProtocol?
+    private var generation = UUID()
+    private let notificationCenter: NotificationCenter
+    private let disconnectedDeviceID: @Sendable (Notification) -> String?
+    private let deliverDisconnect: @Sendable (@escaping @MainActor @Sendable () -> Void) -> Void
+
+    init(notificationCenter: NotificationCenter = .default,
+         disconnectedDeviceID: @escaping @Sendable (Notification) -> String? = { ($0.object as? AVCaptureDevice)?.uniqueID },
+         deliverDisconnect: @escaping @Sendable (@escaping @MainActor @Sendable () -> Void) -> Void = { callback in
+             Task { @MainActor in callback() }
+         }) {
+        self.notificationCenter = notificationCenter
+        self.disconnectedDeviceID = disconnectedDeviceID; self.deliverDisconnect = deliverDisconnect
+    }
+    private func removeMicrophoneObserver() {
+        generation = UUID()
+        if let microphoneObserver { notificationCenter.removeObserver(microphoneObserver) }
+        microphoneObserver = nil
+    }
+    func observeMicrophone(_ microphoneID: String?, failed: @escaping @MainActor @Sendable (Error) -> Void) {
+        removeMicrophoneObserver()
+        let generation = generation
+        let disconnectedDeviceID = disconnectedDeviceID
+        let deliverDisconnect = deliverDisconnect
+        microphoneObserver = notificationCenter.addObserver(forName: AVCaptureDevice.wasDisconnectedNotification, object: nil, queue: .main) { [weak self] notification in
+            let disconnectedID = disconnectedDeviceID(notification)
+            deliverDisconnect { [weak self] in
+                guard let self, self.generation == generation,
+                      let disconnectedID, disconnectedID == microphoneID else { return }
+                failed(CaptureFailure(kind: .stream, underlying: LaliaError("The microphone disconnected.")))
+            }
+        }
+    }
     func start(session: UUID, store: SessionStore, maximumDuration: Double, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
-        let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+        let content: SCShareableContent
+        do { content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) }
+        catch { throw CaptureOutput.classifyStreamError(error) }
         guard let display = content.displays.first else { throw LaliaError("Mac audio capture requires an available display.") }
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let config = SCStreamConfiguration()
         config.capturesAudio = true
         config.captureMicrophone = true
+        let microphone = AVCaptureDevice.default(for: .audio)
+        config.microphoneCaptureDeviceID = microphone?.uniqueID
         config.excludesCurrentProcessAudio = true
         config.sampleRate = 48_000
         config.channelCount = 2
@@ -150,20 +201,25 @@ private final class CaptureOutput: NSObject, SCStreamOutput, SCStreamDelegate, @
         try stream.addStreamOutput(output, type: .audio, sampleHandlerQueue: output.queue)
         try stream.addStreamOutput(output, type: .microphone, sampleHandlerQueue: output.queue)
         self.stream = stream; self.output = output
+        observeMicrophone(microphone?.uniqueID, failed: failed)
         do { try await stream.startCapture() }
         catch {
             self.stream = nil; self.output = nil
-            do { try await output.finish() } catch { throw LaliaError("Capture failed and could not finalize audio: \(error.localizedDescription)") }
-            throw error
+            removeMicrophoneObserver()
+            let failure = CaptureOutput.classifyStreamError(error)
+            do { try await output.finish() }
+            catch { throw CaptureFailure.preferred(failure, error) }
+            throw failure
         }
     }
     func stop() async throws {
+        removeMicrophoneObserver()
         let stream = self.stream
         let output = self.output
         self.stream = nil; self.output = nil
         var stopError: Error?
-        do { try await stream?.stopCapture() } catch { stopError = error }
-        do { try await output?.finish() } catch { if stopError == nil { stopError = error } }
+        do { try await stream?.stopCapture() } catch { stopError = CaptureOutput.classifyStreamError(error) }
+        do { try await output?.finish() } catch { stopError = CaptureFailure.preferred(stopError, error) }
         if let stopError { throw stopError }
     }
 }

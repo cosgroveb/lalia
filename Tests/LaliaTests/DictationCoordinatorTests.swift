@@ -568,7 +568,9 @@ import Testing
         await failed.coordinator.waitForOperation()
         #expect(failed.coordinator.sessions[0].captureState == .failed)
         #expect(failed.coordinator.sessions[0].segments[0].complete)
-        #expect(failed.coordinator.message.contains("Failed."))
+        #expect(failed.coordinator.sessions[0].captureError == "Failed.")
+        #expect(failed.transcriber.sessionCalls == 1)
+        #expect(failed.coordinator.takeInterruptionNotice()?.reason == .captureFailure)
     }
     @Test func retryPreservesCompletedResponsesAndNotesStaySeparate() async throws {
         let test = CoordinatorFixture()
@@ -650,45 +652,290 @@ import Testing
         #expect(test.coordinator.message.contains("saved without transcription"))
     }
 
-    @Test func listenerLossStopsSessionWithoutSubmittingAnalysis() async throws {
+    @Test func keyboardLossKeepsActiveSession() async {
         let test = CoordinatorFixture()
-        test.coordinator.setGestureAvailability(true)
-        test.coordinator.gestureToggle(UUID())
-        for _ in 0..<20 { await Task.yield() }
-        #expect(test.coordinator.phase == .recordingSession)
-        test.coordinator.setGestureAvailability(false, message: "listener lost")
+        test.coordinator.startSession()
         await test.coordinator.waitForOperation()
-        #expect(test.coordinator.phase == .idle)
-        #expect(test.capture.stopCalls == 1)
-        #expect(test.transcriber.sessionCalls == 0)
-        #expect(test.coordinator.sessions.first?.captureError?.contains("Gesture monitoring was lost") == true)
+        test.coordinator.setGestureAvailability(false, message: "listener lost")
+        #expect(test.coordinator.phase == .recordingSession)
+        #expect(test.capture.stopCalls == 0)
+        await test.coordinator.shutdown()
     }
 
-    @Test func listenerLossDuringSessionStartCannotResumeCapture() async {
+    @Test func keyboardLossDuringSessionStartKeepsCapture() async {
         let test = CoordinatorFixture()
         test.capture.suspend = true
         test.coordinator.startSession()
         while !test.capture.waiting { await Task.yield() }
-        test.coordinator.setGestureAvailability(false, message: "listener lost")
+        test.coordinator.setGestureAvailability(false)
         test.capture.resume()
         await test.coordinator.waitForOperation()
-        #expect(test.coordinator.phase == .idle)
-        #expect(test.capture.stopCalls == 1)
-        #expect(test.transcriber.sessionCalls == 0)
+        #expect(test.coordinator.phase == .recordingSession)
+        await test.coordinator.shutdown()
     }
 
-    @Test func listenerLossWhileMicrophonePermissionIsPendingCannotStartSession() async {
+    @Test func menuCanStartWithoutGestureListener() async {
+        let test = CoordinatorFixture()
+        test.coordinator.setGestureAvailability(false)
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        #expect(test.capture.startCalls == 1)
+        await test.coordinator.shutdown()
+    }
+
+    @Test func eligibleInterruptionStopsAndAnalyzesOnce() async {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        test.coordinator.setSessionUsable(false)
+        test.coordinator.interrupt(.lock)
+        test.coordinator.interrupt(.sleep)
+        await test.coordinator.waitForOperation()
+        #expect(test.capture.stopCalls == 1)
+        #expect(test.transcriber.sessionCalls == 0)
+        #expect(test.coordinator.takeInterruptionNotice() == nil)
+        test.coordinator.setSessionUsable(true)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(test.coordinator.takeInterruptionNotice()?.reason == .lock)
+        #expect(test.coordinator.takeInterruptionNotice() == nil)
+    }
+
+    @Test func terminalExclusionsSuppressAutomaticAnalysis() async {
+        for reason in [SessionInterruption.storageFailure, .audioPermission, .quit] {
+            let test = CoordinatorFixture()
+            test.coordinator.startSession()
+            await test.coordinator.waitForOperation()
+            test.coordinator.interrupt(.captureFailure)
+            test.coordinator.interrupt(reason)
+            await test.coordinator.waitForOperation()
+            #expect(test.transcriber.sessionCalls == 0)
+            #expect(test.coordinator.takeInterruptionNotice() == nil)
+        }
+    }
+
+    @Test func lifecycleLossWhilePermissionIsPendingDoesNotStartCapture() async {
         let test = CoordinatorFixture()
         test.authorizer.suspendMicrophone = true
         test.coordinator.startSession()
         while !test.authorizer.microphoneWaiting { await Task.yield() }
-        test.coordinator.setGestureAvailability(false, message: "listener lost")
+        test.coordinator.setSessionUsable(false)
+        test.coordinator.interrupt(.sleep)
         test.authorizer.resumeMicrophone()
         await test.coordinator.waitForOperation()
         #expect(test.capture.startCalls == 0)
         #expect(test.coordinator.sessions.isEmpty)
-        #expect(test.coordinator.phase == .idle)
     }
+
+    @Test func oldCaptureFailureDoesNotStopNewSession() async {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        let oldFailure = test.capture.fail
+        test.coordinator.stopSession()
+        await test.coordinator.waitForOperation()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        oldFailure?(TestError.failed)
+        #expect(test.coordinator.phase == .recordingSession)
+        #expect(test.capture.stopCalls == 1)
+        await test.coordinator.shutdown()
+    }
+
+    @Test func finalizationStorageFailureOverridesEligibleEnding() async {
+        let test = CoordinatorFixture()
+        test.capture.stopError = CaptureFailure(kind: .storage, underlying: TestError.failed)
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        test.coordinator.interrupt(.captureFailure)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 0)
+        #expect(test.coordinator.takeInterruptionNotice() == nil)
+    }
+
+    @Test func failedCaptureStatusWriteKeepsManualRecovery() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        let id = try #require(test.coordinator.sessions.first).id
+        let directory = test.storage.store.directory(id)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: directory.path) }
+        test.capture.onStop = {
+            try FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: directory.path)
+        }
+        test.capture.fail?(TestError.failed)
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.message.contains("Could not save status"))
+        #expect(test.transcriber.sessionCalls == 0)
+        #expect(test.coordinator.takeInterruptionNotice() == nil)
+    }
+
+    @Test func revokedAudioPermissionKeepsManualRecovery() async {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        test.capture.fail?(CaptureFailure(kind: .permission, underlying: TestError.failed))
+        await test.coordinator.waitForOperation()
+        #expect(test.capture.stopCalls == 1)
+        #expect(test.transcriber.sessionCalls == 0)
+        #expect(test.coordinator.takeInterruptionNotice() == nil)
+    }
+
+    @Test func lifecycleInterruptionDuringStartFinalizesOnce() async {
+        let test = CoordinatorFixture()
+        test.capture.suspend = true
+        test.coordinator.startSession()
+        while !test.capture.waiting { await Task.yield() }
+        test.coordinator.setSessionUsable(false)
+        test.coordinator.interrupt(.sleep)
+        test.capture.resume()
+        await test.coordinator.waitForOperation()
+        #expect(test.capture.stopCalls == 1)
+        #expect(test.coordinator.phase == .idle)
+        test.coordinator.setSessionUsable(true)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(test.coordinator.takeInterruptionNotice()?.reason == .sleep)
+    }
+
+    @Test func newSessionSuppressesOldNoticeAndStopHasNoNotice() async {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        test.coordinator.interrupt(.captureFailure)
+        await test.coordinator.waitForOperation()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        test.coordinator.stopSession()
+        await test.coordinator.waitForOperation()
+        #expect(test.coordinator.takeInterruptionNotice() == nil)
+    }
+
+    @Test func eligibleFailureProducesMarkedPartialTranscript() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        let id = try #require(test.coordinator.sessions.first).id
+        try test.storage.store.update(id) {
+            $0.segments.append(AudioSegment(id: UUID(), source: .system, filename: "broken.caf", start: 0, sampleRate: 16_000, channels: 1))
+        }
+        test.capture.fail?(TestError.failed)
+        await test.coordinator.waitForOperation()
+        let record = try test.storage.store.read(id)
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(record.analysis?.active?.incomplete == true)
+        #expect(!record.transcriptionComplete)
+        #expect(record.transcript.hasPrefix("[Incomplete transcript:"))
+        #expect(test.coordinator.lastTranscript?.hasPrefix("[Incomplete transcript:") == true)
+    }
+
+    @Test func interruptedPartialAudioRemainsEligibleForManualProcessing() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        let id = try #require(test.coordinator.sessions.first).id
+        try test.storage.store.update(id) {
+            $0.segments.append(AudioSegment(id: UUID(), source: .system, filename: "broken.caf", start: 0, sampleRate: 16_000, channels: 1))
+        }
+        test.transcriber.transcriptionError = TestError.failed
+        test.capture.fail?(TestError.failed)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(try test.storage.store.read(id).analysis?.input?.incomplete == true)
+        test.transcriber.transcriptionError = nil
+        test.coordinator.retry(id)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 2)
+        #expect(try test.storage.store.read(id).analysis?.attempt?.state == .complete)
+        test.coordinator.reprocess(id)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 3)
+        #expect(try test.storage.store.read(id).analysis?.active?.incomplete == true)
+    }
+
+    @Test func interruptedPartialAudioCanRetryAfterInvalidProfile() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        let id = try #require(test.coordinator.sessions.first).id
+        try test.storage.store.update(id) {
+            $0.segments.append(AudioSegment(id: UUID(), source: .system, filename: "broken.caf", start: 0, sampleRate: 16_000, channels: 1))
+        }
+        test.transcriber.configuration = OMLXConfiguration(baseURL: "https://example.com/v1")
+        test.capture.fail?(TestError.failed)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 0)
+        #expect(try test.storage.store.read(id).transcriptionError != nil)
+        #expect(try test.storage.store.read(id).analysis?.attempt == nil)
+        test.transcriber.configuration = OMLXConfiguration()
+        test.coordinator.retry(id)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(try test.storage.store.read(id).analysis?.attempt?.state == .complete)
+        #expect(try test.storage.store.read(id).analysis?.active?.incomplete == true)
+    }
+
+    @Test func cancelledInterruptedAnalysisKeepsPartialEligibilityForManualRetry() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        let id = try #require(test.coordinator.sessions.first).id
+        try test.storage.store.update(id) {
+            $0.segments.append(AudioSegment(id: UUID(), source: .system, filename: "broken.caf", start: 0, sampleRate: 16_000, channels: 1))
+        }
+        let first = try savedAudio(test.storage.store)
+        test.transcriber.suspend = true
+        test.coordinator.reprocess(first.id)
+        while !test.transcriber.waiting { await Task.yield() }
+        test.capture.fail?(TestError.failed)
+        while test.coordinator.phase != .idle { await Task.yield() }
+        test.coordinator.cancelProcessing(id)
+        #expect(try test.storage.store.read(id).transcriptionError?.contains("cancelled before starting") == true)
+        test.transcriber.suspend = false; test.transcriber.resume()
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(try test.storage.store.read(id).analysis?.attempt == nil)
+        test.coordinator.retry(id)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 2)
+        #expect(try test.storage.store.read(id).analysis?.active?.incomplete == true)
+    }
+
+    @Test func failureDeliveredDuringStopIsRetained() async throws {
+        for kind in [CaptureFailure.Kind.storage, .permission] {
+            let test = CoordinatorFixture()
+            test.coordinator.startSession()
+            await test.coordinator.waitForOperation()
+            let id = try #require(test.coordinator.sessions.first).id
+            test.capture.onStop = {
+                test.capture.fail?(CaptureFailure(kind: kind, underlying: TestError.failed))
+            }
+            test.coordinator.interrupt(.sleep)
+            await test.coordinator.waitForOperation()
+            let record = try test.storage.store.read(id)
+            #expect(record.captureState == .failed)
+            #expect(record.captureError == "Failed.")
+            #expect(test.transcriber.sessionCalls == 0)
+            #expect(test.coordinator.takeInterruptionNotice() == nil)
+        }
+    }
+
+    @Test func malformedFinalAudioStillSubmitsEarlierAudio() async throws {
+        let test = CoordinatorFixture()
+        test.coordinator.startSession()
+        await test.coordinator.waitForOperation()
+        let id = try #require(test.coordinator.sessions.first).id
+        try test.capture.writer?.finish()
+        try test.capture.writer?.append(pcm(frames: 48_000), source: .microphone, timestamp: 1)
+        let last = try #require(test.storage.store.read(id).segments.last)
+        try Data().write(to: test.storage.store.file(id, last.partialFilename), options: .atomic)
+        test.capture.fail?(TestError.failed)
+        await test.coordinator.waitForOperation()
+        #expect(test.transcriber.sessionCalls == 1)
+        #expect(test.coordinator.takeInterruptionNotice()?.reason == .captureFailure)
+        #expect(try test.storage.store.read(id).analysis?.active?.incomplete == true)
+    }
+
 }
 
 private enum TestError: LocalizedError { case failed; var errorDescription: String? { "Failed." } }
@@ -758,6 +1005,7 @@ private final class TestRecorder: Recording {
     var waiting = false
     private var continuation: CheckedContinuation<Void, Never>?
     var onStart: (() -> Void)?
+    var onStop: (() throws -> Void)?
     func start(session: UUID, store: SessionStore, maximumDuration: Double, failed: @escaping @MainActor @Sendable (Error) -> Void) async throws {
         onStart?()
         startCalls += 1; fail = failed
@@ -768,6 +1016,7 @@ private final class TestRecorder: Recording {
     }
     func stop() async throws {
         stopCalls += 1; try writer?.finish(); writer = nil
+        try onStop?()
         if let stopError { throw stopError }
     }
     func resume() { continuation?.resume(); continuation = nil }
@@ -777,6 +1026,7 @@ private final class TestRecorder: Recording {
     var prepareCalls = 0; var transcriptionCalls = 0
     var sessionCalls = 0
     var profile = SessionTranscriptionProfile()
+    var configuration: OMLXConfiguration?
     var requestedProfiles: [SessionTranscriptionProfile] = []
     var sessionResponse: Data?
     var notesInput: String?
@@ -795,7 +1045,10 @@ private final class TestRecorder: Recording {
         return Transcription(text: output, segments: [.init(start: 0, end: duration, text: output)])
     }
     func resume() { continuation?.resume(); continuation = nil }
-    func sessionProfile() throws -> SessionTranscriptionProfile { profile }
+    func sessionProfile() throws -> SessionTranscriptionProfile {
+        if let configuration { return try OMLXClient(configuration: .success(configuration)).sessionProfile() }
+        return profile
+    }
     func prepareSession(profile: SessionTranscriptionProfile) async throws { try await prepare() }
     func transcribeSession(_ file: URL, profile: SessionTranscriptionProfile) async throws -> Data {
         sessionCalls += 1; requestedProfiles.append(profile)

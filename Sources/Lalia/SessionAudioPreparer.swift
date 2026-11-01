@@ -2,21 +2,33 @@ import AVFoundation
 import Foundation
 
 struct SessionAudioPreparer: Sendable {
-    func prepare(session id: UUID, store: SessionStore) throws -> SessionAnalysis.Input {
+    func prepare(session id: UUID, store: SessionStore, allowIncomplete: Bool = false) throws -> SessionAnalysis.Input {
         let record = try store.read(id)
         guard record.captureState != .recording else { throw LaliaError("Stop recording before transcription.") }
         guard record.duration <= SessionTranscriptionProfile.maximumDuration else {
             throw LaliaError("Speaker labels support recordings up to 60 minutes. This recording and its transcript are unchanged.")
         }
-        if let input = record.analysis?.input, FileManager.default.fileExists(atPath: try store.file(id, input.filename).path) {
+        if !allowIncomplete, let input = record.analysis?.input, input.incomplete != true, FileManager.default.fileExists(atPath: try store.file(id, input.filename).path) {
             let file = try AVAudioFile(forReading: store.file(id, input.filename))
             guard file.length == input.frames, file.processingFormat.sampleRate == 16_000, file.processingFormat.channelCount == 1 else {
                 throw LaliaError("Mixed audio no longer matches its saved metadata.")
             }
             return input
         }
-        guard record.segments.contains(where: \.complete) else { throw LaliaError("No recoverable audio is available.") }
-        guard record.segments.allSatisfy(\.complete) else { throw LaliaError("Some captured audio could not be recovered. Original files are retained.") }
+        guard allowIncomplete || record.segments.allSatisfy(\.complete) else { throw LaliaError("Some captured audio could not be recovered. Original files are retained.") }
+        var segments: [AudioSegment] = []
+        for segment in record.segments where segment.complete {
+            do {
+                let file = try AVAudioFile(forReading: store.file(id, segment.filename))
+                guard file.length == segment.frames else { throw LaliaError("Captured audio no longer matches its saved metadata.") }
+                file.close()
+                segments.append(segment)
+            } catch {
+                if !allowIncomplete { throw error }
+            }
+        }
+        guard !segments.isEmpty else { throw LaliaError("No recoverable audio is available.") }
+        let incomplete = segments.count != record.segments.count
         let frames = Int64((record.duration * 16_000).rounded())
         guard frames > 0, frames <= Int64(SessionTranscriptionProfile.maximumDuration * 16_000),
               let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1),
@@ -26,7 +38,7 @@ struct SessionAudioPreparer: Sendable {
         var runs: [(start: Int64, file: AVAudioFile)] = []
         for source in AudioSource.allCases {
             var groups: [[AudioSegment]] = []
-            for segment in record.segments.filter({ $0.source == source }).sorted(by: { $0.start < $1.start }) {
+            for segment in segments.filter({ $0.source == source }).sorted(by: { $0.start < $1.start }) {
                 if let last = groups.last?.last,
                    last.sampleRate == segment.sampleRate, last.channels == segment.channels,
                    abs(last.start + last.duration - segment.start) <= 1.5 / segment.sampleRate {
@@ -90,7 +102,7 @@ struct SessionAudioPreparer: Sendable {
         let destination = try store.file(id, "session-mix.wav")
         // rename atomically replaces a disposable derived mix, never an original.
         guard rename(partial.path, destination.path) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        let saved = SessionAnalysis.Input(filename: destination.lastPathComponent, frames: frames, silence: peak == 0)
+        let saved = SessionAnalysis.Input(filename: destination.lastPathComponent, frames: frames, silence: peak == 0, incomplete: incomplete ? true : nil)
         try store.update(id) { record in
             if record.analysis == nil { record.analysis = SessionAnalysis() }
             record.analysis?.input = saved

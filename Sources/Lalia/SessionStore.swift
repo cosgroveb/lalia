@@ -21,7 +21,7 @@ struct SessionRecord: Codable, Identifiable, Sendable {
     var endedAtLimit: Bool?
     var notesStale: Bool { notes != nil && notesRevision != analysis?.active?.revision }
     var transcriptionComplete: Bool {
-        if analysis?.active != nil { return segments.allSatisfy { $0.complete } }
+        if analysis?.active != nil { return analysis?.active?.incomplete != true && segments.allSatisfy { $0.complete } }
         return legacyTranscriptionComplete
     }
     private var legacyTranscriptionComplete: Bool {
@@ -30,10 +30,10 @@ struct SessionRecord: Codable, Identifiable, Sendable {
     var hasLegacyTranscript: Bool { legacyTranscriptionComplete || !blocks.isEmpty }
     var duration: Double { segments.map { $0.start + $0.duration }.max() ?? 0 }
     var transcript: String {
-        if let active = analysis?.active { return active.transcript }
+        if let active = analysis?.active { return (active.incomplete == true ? "[Incomplete transcript: some audio could not be recovered.]\n\n" : "") + active.transcript }
         return blocks.map { "[\(Self.timestamp($0.start))–\(Self.timestamp($0.end))] \($0.source.label) (approximate)\n\($0.text)" }.joined(separator: "\n\n")
     }
-    var plainTranscript: String { analysis?.active?.transcript ?? blocks.map(\.text).joined(separator: " ") }
+    var plainTranscript: String { (analysis?.active != nil ? transcript : nil) ?? blocks.map(\.text).joined(separator: " ") }
     struct Block { var source: AudioSource; var start: Double; var end: Double; var text: String }
     var blocks: [Block] {
         jobs.flatMap { job -> [Block] in
@@ -218,21 +218,23 @@ final class SessionStore: @unchecked Sendable {
         guard frames > 0 else { throw LaliaError("Recording contains no audio frames.") }
         let sampleRate = audio.processingFormat.sampleRate
         let channels = audio.processingFormat.channelCount
-        if source == partial { try manager.moveItem(at: partial, to: final) }
-        try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: final.path)
-        try update(id) { record in
-            guard let index = record.segments.firstIndex(where: { $0.id == segmentID }) else { return }
-            record.segments[index].frames = frames
-            record.segments[index].sampleRate = sampleRate
-            record.segments[index].channels = channels
-            record.segments[index].complete = true
-            record.segments[index].error = nil
-            if !segment.complete {
-                record.jobsPrepared = false
-                record.analysis?.input = nil
-                if record.notes != nil { record.notesError = "Recovered audio changed the transcript. Generate notes again after transcription." }
+        do {
+            if source == partial { try manager.moveItem(at: partial, to: final) }
+            try manager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: final.path)
+            try update(id) { record in
+                guard let index = record.segments.firstIndex(where: { $0.id == segmentID }) else { return }
+                record.segments[index].frames = frames
+                record.segments[index].sampleRate = sampleRate
+                record.segments[index].channels = channels
+                record.segments[index].complete = true
+                record.segments[index].error = nil
+                if !segment.complete {
+                    record.jobsPrepared = false
+                    record.analysis?.input = nil
+                    if record.notes != nil { record.notesError = "Recovered audio changed the transcript. Generate notes again after transcription." }
+                }
             }
-        }
+        } catch { throw CaptureFailure(kind: .storage, underlying: error) }
     }
 
     func history(recover: Bool = false) throws -> (records: [SessionRecord], diagnostics: [String]) {

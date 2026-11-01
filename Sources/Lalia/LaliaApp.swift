@@ -59,11 +59,64 @@ import SwiftUI
     var coordinator: DictationCoordinator?
     var gestureMonitor: OptionGestureMonitor?
     private var terminating = false
+    private let lifecycle = SessionLifecycleMonitor()
+    private var noticeScheduled = false
+    private var noticeAlert: NSAlert?
+
+    func connect(coordinator: DictationCoordinator, gestures: OptionGestureMonitor) {
+        self.coordinator = coordinator
+        gestureMonitor = gestures
+        lifecycle.onUsabilityChanged = { usable in
+            gestures.setSessionUsable(usable)
+            coordinator.setSessionUsable(usable)
+        }
+        lifecycle.onInterruption = { coordinator.interrupt($0) }
+        coordinator.onInterruptionNotice = { [weak self] in self?.presentInterruptionNotice() }
+        coordinator.onCaptureAvailabilityChanged = { [weak self] available, active in
+            gestures.setCaptureState(available: available, active: active)
+            if active, let alert = self?.noticeAlert {
+                alert.window.orderOut(nil)
+                self?.noticeAlert = nil
+            }
+        }
+        lifecycle.start()
+    }
+
+    private func presentInterruptionNotice() {
+        guard !terminating, !noticeScheduled, noticeAlert == nil else { return }
+        noticeScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.noticeScheduled = false
+            guard !self.terminating, let notice = self.coordinator?.takeInterruptionNotice() else { return }
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = notice.title
+            alert.informativeText = notice.message
+            let dismiss = alert.addButton(withTitle: "OK")
+            dismiss.target = self
+            dismiss.action = #selector(self.dismissInterruptionNotice)
+            self.noticeAlert = alert
+            NSApp.activate()
+            alert.window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @objc private func dismissInterruptionNotice() {
+        noticeAlert?.window.orderOut(nil)
+        noticeAlert = nil
+    }
+
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         guard !terminating else { return .terminateLater }
         terminating = true
-        gestureMonitor?.stop()
-        Task { await coordinator?.shutdown(); sender.reply(toApplicationShouldTerminate: true) }
+        lifecycle.stop()
+        dismissInterruptionNotice()
+        Task {
+            await coordinator?.shutdown()
+            gestureMonitor?.stop()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
         return .terminateLater
     }
 }
@@ -90,19 +143,26 @@ struct LaliaApp: App {
             }
         }
         gestures.onAvailability = { available, message in coordinator.setGestureAvailability(available, message: message) }
-        coordinator.onCaptureAvailabilityChanged = { available, active in
-            gestures.setCaptureState(available: available, active: active)
-        }
+        delegate.connect(coordinator: coordinator, gestures: gestures)
         coordinator.startupRefresh()
         gestures.start()
         delegate.coordinator = coordinator
     }
     var body: some Scene {
-        MenuBarExtra("Lalia", systemImage: coordinator.phase == .recording || coordinator.phase == .recordingSession ? "record.circle.fill" : "waveform") {
+        MenuBarExtra {
             LaliaMenu(coordinator: coordinator, gestures: gestures)
                 .onAppear { delegate.coordinator = coordinator }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "waveform")
+                if !coordinator.gestureAvailable { Image(systemName: "exclamationmark.triangle") }
+                if coordinator.phase == .recording || coordinator.phase == .recordingSession { Image(systemName: "record.circle.fill") }
+            }
+            .help(coordinator.shortcutStatus)
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("Lalia. \(coordinator.phase == .recording ? "Dictating." : coordinator.phase == .recordingSession ? "Transcribing." : "Not capturing audio.") \(coordinator.shortcutStatus)")
         }
-        Window("Lalia Recordings", id: "history") {
+        Window("Lalia Transcripts", id: "history") {
             HistoryView(coordinator: coordinator, playback: playback)
                 .onAppear { delegate.coordinator = coordinator }
         }
@@ -120,18 +180,18 @@ private struct LaliaMenu: View {
         if !coordinator.isDictationEnabled {
             Button("Enable Dictation") { Task { await coordinator.enableDictation() } }.disabled(!coordinator.available)
         }
-        if !coordinator.gestureAvailable {
-            Button("Enable Gestures") {
+        if !coordinator.gestureAvailable && !CGPreflightListenEventAccess() {
+            Button("Allow Keyboard Shortcuts") {
                 Task {
                     if await coordinator.enableGestures() { gestures.start() }
                 }
             }
         }
-        if let gestureMessage = coordinator.gestureMessage { Text(gestureMessage) }
+        if !coordinator.gestureAvailable { Text(coordinator.shortcutStatus) }
         RecordingButton(coordinator: coordinator)
-        if !coordinator.processing.isEmpty { Text("\(coordinator.processing.count) recordings queued or processing") }
+        if !coordinator.processing.isEmpty { Text("Preparing \(coordinator.processing.count) transcripts") }
         if coordinator.canCancel { Button("Cancel Current Processing") { coordinator.cancelProcessing() } }
-        Button("Recording History") { coordinator.refreshHistory(); openWindow(id: "history"); NSApp.activate() }
+        Button("Transcript History") { coordinator.refreshHistory(); openWindow(id: "history"); NSApp.activate() }
         Button("Copy Last Transcript") { coordinator.copyLastTranscript() }.disabled(coordinator.lastTranscript == nil)
         Divider()
         Button("Check Runtime Setup") {
@@ -155,10 +215,10 @@ struct RecordingButton: View {
             Text("\(SessionRecord.timestamp(coordinator.recordingElapsed)) elapsed · \(SessionRecord.timestamp(coordinator.recordingRemaining)) remaining")
                 .foregroundStyle(coordinator.recordingWarning ? .orange : .secondary)
         }
-        Button(coordinator.phase == .recordingSession ? "Stop Recording" : "Start Recording") {
+        Button(coordinator.phase == .recordingSession ? "Stop Transcribing" : "Start Transcribing") {
             coordinator.toggleRecording()
         }
-        .disabled(coordinator.phase != .recordingSession && (!coordinator.available || !coordinator.gestureAvailable))
-        .help("Double-tap Right Option to start or stop recording microphone and Mac audio for up to 60 minutes.")
+        .disabled(coordinator.phase != .recordingSession && !coordinator.available)
+        .help("Double-tap Right Option to start or stop transcribing microphone and Mac audio for up to 60 minutes.")
     }
 }

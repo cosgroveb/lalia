@@ -5,6 +5,92 @@ import Testing
 @testable import Lalia
 
 @MainActor struct OptionGestureMonitorTests {
+    @Test func listenerRecoveryUsesCappedBackoff() {
+        var retry = GestureRecoveryBackoff()
+        #expect((0..<7).map { _ in retry.next() } == [0.5, 1, 2, 4, 8, 8, 8])
+        retry.reset()
+        #expect(retry.next() == 0.5)
+    }
+
+    @Test func permissionRecoveryDoesNotPromptAndStopCancelsRetry() {
+        var prompts = 0
+        let monitor = OptionGestureMonitor(permission: { false }, secureInput: { false }, requestAccess: { prompts += 1 })
+        monitor.start()
+        #expect(monitor.isMonitoring)
+        #expect(monitor.hasRecoveryTimer)
+        monitor.start()
+        #expect(prompts == 0)
+        monitor.setSessionUsable(false)
+        #expect(!monitor.hasRecoveryTimer)
+        monitor.setSessionUsable(true)
+        #expect(monitor.hasRecoveryTimer)
+        monitor.stop()
+        #expect(!monitor.isMonitoring)
+        #expect(!monitor.hasRecoveryTimer)
+        monitor.setSessionUsable(true)
+        #expect(!monitor.hasRecoveryTimer)
+    }
+
+    @Test func reconnectSeedsHeldKeysAndStopRejectsPendingRetry() async throws {
+        var creates = 0
+        var secureInput = false
+        var scheduled: [(timer: Timer, fire: () -> Void)] = []
+        var availability: [Bool] = []
+        var actions: [GestureAction] = []
+        let monitor = OptionGestureMonitor(permission: { true }, secureInput: { secureInput },
+            createTap: { _ in
+                creates += 1
+                return creates == 1 ? nil : CFMachPortCreate(kCFAllocatorDefault, { _, _, _, _ in }, nil, nil)
+            }, enableTap: { _ in }, tapIsEnabled: { _ in true },
+            makeTimer: { delay, repeats, callback in
+                let timer = Timer(timeInterval: delay, repeats: repeats, block: callback)
+                scheduled.append((timer, { callback(timer) }))
+                return timer
+            }, physicalSnapshot: { ([.left], []) })
+        monitor.onAvailability = { available, _ in availability.append(available) }
+        monitor.onAction = { actions.append($0) }
+        monitor.start()
+        #expect(creates == 1)
+        #expect(availability == [false])
+        let retry = try #require(scheduled.first)
+        retry.fire()
+        #expect(creates == 2)
+        #expect(availability == [false, true])
+        #expect(!monitor.hasRecoveryTimer)
+        var eventTime = ProcessInfo.processInfo.systemUptime
+        func option(_ key: Int, flags: UInt64) throws {
+            eventTime += 0.05
+            let event = try keyboardEvent(key, flags: flags)
+            event.timestamp = UInt64(eventTime * 1_000_000_000)
+            _ = monitor.receive(event, type: .flagsChanged)
+        }
+        for _ in 0..<2 {
+            try option(kVK_RightOption, flags: UInt64(NX_DEVICELALTKEYMASK | NX_DEVICERALTKEYMASK))
+            try option(kVK_RightOption, flags: UInt64(NX_DEVICELALTKEYMASK))
+        }
+        await drainMainQueue()
+        #expect(actions.isEmpty)
+        try option(kVK_Option, flags: 0)
+        for _ in 0..<2 {
+            try option(kVK_RightOption, flags: UInt64(NX_DEVICERALTKEYMASK))
+            try option(kVK_RightOption, flags: 0)
+        }
+        await drainMainQueue()
+        #expect(actions.count == 1)
+        guard case .toggleRecording? = actions.first else { Issue.record("Expected fresh double tap"); monitor.stop(); return }
+        monitor.setSessionUsable(false)
+        secureInput = true
+        monitor.setSessionUsable(true)
+        let pending = try #require(scheduled.last)
+        #expect(monitor.hasRecoveryTimer)
+        monitor.stop()
+        secureInput = false
+        pending.fire()
+        #expect(creates == 2)
+        #expect(!monitor.isMonitoring)
+        #expect(!monitor.hasRecoveryTimer)
+    }
+
     @Test func observesAllChordAndLifecycleInputs() {
         #expect(OptionGestureMonitor.observedEventTypes == [
             .flagsChanged, .keyDown, .keyUp, .leftMouseDown, .rightMouseDown, .otherMouseDown,

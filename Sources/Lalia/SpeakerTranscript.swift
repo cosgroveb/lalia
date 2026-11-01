@@ -28,6 +28,7 @@ struct SessionAnalysis: Codable, Sendable {
         var filename: String
         var frames: Int64
         var silence: Bool
+        var incomplete: Bool?
         var duration: Double { Double(frames) / 16_000 }
     }
     struct Attempt: Codable, Identifiable, Sendable {
@@ -38,6 +39,7 @@ struct SessionAnalysis: Codable, Sendable {
         var error: String?
         var rawResponse: Data?
     }
+    var allowsIncompleteInput: Bool?
     var input: Input?
     var attempt: Attempt?
     var active: SpeakerTranscript?
@@ -56,6 +58,7 @@ struct SpeakerTranscript: Codable, Identifiable, Sendable {
     }
     var id: UUID
     var revision = UUID()
+    var incomplete: Bool?
     var profile: SessionTranscriptionProfile
     var rawResponse: Data
     var turns: [Turn]

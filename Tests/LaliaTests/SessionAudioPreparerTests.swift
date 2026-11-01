@@ -4,6 +4,34 @@ import Testing
 @testable import Lalia
 
 struct SessionAudioPreparerTests {
+    @Test func interruptedInputUsesCompleteSegmentsAndKeepsOriginals() throws {
+        let fixture = TemporaryStore(); let store = fixture.store; let record = try store.create(kind: .session)
+        let writer = SourceAudioWriter(store: store, session: record.id, origin: 0)
+        try writer.append(pcm(rate: 16_000, channels: 1, frames: 16_000), source: .microphone, timestamp: 2)
+        try writer.finish()
+        let original = try #require(store.read(record.id).segments.first)
+        let bytes = try Data(contentsOf: store.file(record.id, original.filename))
+        try store.update(record.id) {
+            $0.captureState = .failed
+            $0.segments.append(AudioSegment(id: UUID(), source: .system, filename: "broken.caf", start: 0, sampleRate: 16_000, channels: 1))
+        }
+        #expect(throws: Error.self) { try SessionAudioPreparer().prepare(session: record.id, store: store) }
+        let input = try SessionAudioPreparer().prepare(session: record.id, store: store, allowIncomplete: true)
+        #expect(input.incomplete == true)
+        #expect(input.frames == 48_000)
+        let samples = try values(input, session: record.id, store: store)
+        #expect(samples[..<32_000].allSatisfy { $0 == 0 })
+        #expect(samples[32_000...].contains { $0 != 0 })
+        #expect(try Data(contentsOf: store.file(record.id, original.filename)) == bytes)
+        #expect(throws: Error.self) { try SessionAudioPreparer().prepare(session: record.id, store: store) }
+    }
+
+    @Test func interruptedInputWithNoUsableAudioFails() throws {
+        let fixture = TemporaryStore(); let record = try fixture.store.create(kind: .session)
+        try fixture.store.update(record.id) { $0.captureState = .failed }
+        #expect(throws: Error.self) { try SessionAudioPreparer().prepare(session: record.id, store: fixture.store, allowIncomplete: true) }
+    }
+
     private func values(_ input: SessionAnalysis.Input, session: UUID, store: SessionStore) throws -> [Float] {
         let file = try AVAudioFile(forReading: store.file(session, input.filename))
         let buffer = try #require(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)))

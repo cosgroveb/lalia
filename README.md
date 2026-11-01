@@ -17,8 +17,9 @@ configures Lalia. Use `Check Runtime Setup` in the menu if transcription fails.
 
 ## Use
 
-Choose `Enable Dictation` and `Enable Gestures` in the menu, then grant the
-requested macOS permissions:
+Choose `Enable Dictation` in the menu, then grant the
+requested macOS permissions. Use `Allow Keyboard Shortcuts` if Input Monitoring
+is missing:
 
 | Permission | Used for |
 | --- | --- |
@@ -29,7 +30,7 @@ requested macOS permissions:
 
 - Dictate: focus a text field, hold Right Option, speak after Recording appears,
   then release to paste. Use `Copy Last Transcript` if pasting fails.
-- Record a session: double-tap Right Option to start recording microphone and Mac
+- Transcribe a session: double-tap Right Option to start recording microphone and Mac
   audio. Double-tap again to save and transcribe. The menu has the same controls.
   Sessions stop at 60 minutes. Use headphones to reduce playback leaking into
   the microphone.
@@ -37,16 +38,18 @@ requested macOS permissions:
 Speaker labels are experimental. MOSS can omit speech or invent text and speaker
 labels. Review transcripts against the saved audio.
 
-Open `Recording History` to play audio, copy or export transcripts, correct
+Open `Transcript History` to play audio, copy or export transcripts, correct
 speaker labels, or retry failed transcription. You can record while earlier
 audio transcribes. Queued dictation saves text without pasting, so copy it from
 History. Retranscription preserves the current transcript until a replacement
 succeeds, with `Restore Previous Transcript` available afterward.
 
 Lalia saves audio under `~/Library/Application Support/Lalia/Sessions/` until
-you delete it. `Reveal Recordings` opens a recording's directory. Sleep or
-closing the lid can interrupt capture. After wake, choose `Enable Gestures` to
-restore the listener.
+you delete it. `Reveal Recordings` opens a recording's directory. Sleep, screen lock, or switching users ends the session and starts transcript
+preparation when you return. Lalia shows a notice so you can start another session.
+Keyboard interruptions leave sessions running and shortcuts recover on their own.
+A warning beside the menu-bar icon identifies unavailable shortcuts. Use menu
+`Stop Transcribing` if the shortcut is unavailable.
 
 ## Configuration
 
