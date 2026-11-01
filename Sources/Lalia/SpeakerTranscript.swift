@@ -15,6 +15,19 @@ struct SessionTranscriptionProfile: Codable, Equatable, Sendable {
     var maximumUploadBytes = 250_000_000
     var timeout = 2_400.0
 
+    func bounded(duration: Double) throws -> Self {
+        try validate()
+        guard duration.isFinite, duration > 0, duration <= Self.maximumSavedDuration else {
+            throw LaliaError("Cannot transcribe audio with an invalid duration.")
+        }
+        var bounded = self
+        // Allow timestamp/speaker markup and fast speech without giving a short
+        // clip the full hour-long output budget. The runtime enforces this too.
+        bounded.maximumTokens = min(maximumTokens, 49_152, 256 + Int(ceil(32 * duration)))
+        bounded.timeout = min(timeout, 30 + 2 * duration)
+        return bounded
+    }
+
     func validate() throws {
         _ = try OMLXConfiguration(baseURL: baseURL, transcriptionModel: model, language: language).endpoint("models")
         guard maximumTokens > 0, maximumTokens < contextTokens, contextTokens <= 131_072,

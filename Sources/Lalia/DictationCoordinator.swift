@@ -375,9 +375,9 @@ import Foundation
             if !reprocess, record.analysis?.attempt?.state == .complete || (record.analysis?.attempt == nil && record.transcriptionComplete) {
                 processingMessage("Transcript already saved. Use Reprocess to replace it.", for: id); return
             }
-            let profile = try (!reprocess ? record.analysis?.attempt?.profile : nil) ?? transcriber.sessionProfile()
+            var profile = try (!reprocess ? record.analysis?.attempt?.profile : nil) ?? transcriber.sessionProfile()
             let allowIncomplete = record.analysis?.allowsIncompleteInput == true
-            let attempt = SessionAnalysis.Attempt(profile: profile)
+            var attempt = SessionAnalysis.Attempt(profile: profile)
             try store.update(id) { record in
                 if record.analysis == nil { record.analysis = SessionAnalysis() }
                 record.analysis?.attempt = attempt
@@ -387,6 +387,9 @@ import Foundation
             let preparation = Task.detached { try SessionAudioPreparer().prepare(session: id, store: store, allowIncomplete: allowIncomplete) }
             let input = try await withTaskCancellationHandler { try await preparation.value } onCancel: { preparation.cancel() }
             try Task.checkCancellation()
+            profile = try profile.bounded(duration: input.duration)
+            attempt.profile = profile
+            try store.update(id) { $0.analysis?.attempt?.profile = profile }
             var accepted: SpeakerTranscript
             if input.silence { accepted = SpeakerTranscript(silenceFor: attempt) }
             else {

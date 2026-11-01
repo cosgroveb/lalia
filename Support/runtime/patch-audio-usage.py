@@ -62,6 +62,63 @@ REPLACEMENTS = {
 }
 
 
+CONTROL = Path(__file__).with_name("transcription_control.py").read_text()
+REPLACEMENTS["omlx/api/audio_routes.py"] += [
+    ("    APIRouter,\n", "    APIRouter,\n    Request,\n"),
+    ("async def create_transcription(\n", "async def create_transcription(\n    request: Request,\n    timeout_seconds: Optional[float] = Form(None, gt=0, le=2400),\n"),
+    ("        result = await engine.transcribe(tmp_path, **transcribe_kwargs)",
+     "        from omlx.engine.stt import guarded_transcription\n"
+     "        result = await guarded_transcription(request, engine, tmp_path, transcribe_kwargs, timeout_seconds)"),
+    ("        if stream:\n            # Word timestamps", "        if stream:\n            raise HTTPException(status_code=400, detail='The Lalia runtime requires non-streaming transcription.')\n\n        if stream:\n            # Word timestamps"),
+    ("        result = await guarded_transcription(request, engine, tmp_path, transcribe_kwargs, timeout_seconds)\n    except HTTPException:",
+     "        result = await guarded_transcription(request, engine, tmp_path, transcribe_kwargs, timeout_seconds)\n"
+     "    except TimeoutError as exc:\n        raise HTTPException(status_code=504, detail=str(exc)) from exc\n"
+     "    except HTTPException:"),
+]
+REPLACEMENTS["omlx/engine/stt.py"] += [
+    ("class STTEngine(", CONTROL + "\n\nclass STTEngine("),
+    ("        model = self._model\n        t0 = time.monotonic()\n\n        def _normalize_segment", "        model = self._model\n        control = kwargs.pop('_lalia_control', None)\n        if control is None:\n            control = TranscriptionControl(5400, kwargs.get('max_tokens'))\n        t0 = time.monotonic()\n\n        def _normalize_segment"),
+    ("            result = model.generate(audio_path, **gen_kwargs)",
+     "            control.check()\n"
+     "            from mlx_audio.audio_io import read as read_audio\n"
+     "            audio, sample_rate = read_audio(audio_path, dtype='float32', sample_rate=model.sample_rate, nchannels=1, duration=5400 + 1 / model.sample_rate)\n"
+     "            control.limit_duration(len(audio) / sample_rate)\n"
+     "            gen_kwargs['max_tokens'] = control.max_tokens\n"
+     "            gen_kwargs['stop_check'] = control.check\n"
+     "            result = model.generate(audio, **gen_kwargs)\n"
+     "            control.check()"),
+    ('                "duration": 0.0,\n            }\n\n        activity_id = self._begin_activity(\n            "transcribing",',
+     '                "duration": 0.0,\n            }\n\n'
+     "        def _guarded_sync():\n"
+     "            try:\n                control.check()\n                return _transcribe_sync()\n"
+     "            finally:\n"
+     "                from mlx_audio.lm.generate import generation_stream\n"
+     "                mx.synchronize(generation_stream)\n"
+     "                mx.synchronize()\n"
+     "                mx.clear_cache()\n\n"
+     "        activity_id = self._begin_activity(\n            \"transcribing\","),
+    ("            result = await loop.run_in_executor(\n                get_mlx_executor(), _transcribe_sync\n            )",
+     "            worker = loop.run_in_executor(get_mlx_executor(), _guarded_sync)\n"
+     "            result = await finish_worker(worker, control)"),
+]
+REPLACEMENTS["omlx/engine/stt.py"].append((
+    "            await self._finish_activity(activity_id)\n\n    def supports_native_stt_streaming",
+    "            self._end_activity(activity_id)\n\n    def supports_native_stt_streaming",
+))
+REPLACEMENTS["mlx_audio/stt/models/moss_transcribe_diarize/moss_transcribe_diarize.py"] = [
+    ("        hotwords: Optional[List[str]] = None,\n        **kwargs,", "        hotwords: Optional[List[str]] = None,\n        stop_check=None,\n        **kwargs,"),
+    ("        start_time = time.time()\n        prefill_start = time.time()", "        stop_check = stop_check or (lambda: None)\n        stop_check()\n        start_time = time.time()\n        prefill_start = time.time()"),
+    ("        prefill_time = time.time() - prefill_start\n        eos_token_ids", "        stop_check()\n        prefill_time = time.time() - prefill_start\n        eos_token_ids"),
+    ("            generated_tokens.append(int(token))\n\n        gen_time", "            generated_tokens.append(int(token))\n        else:\n            raise RuntimeError('Transcription exhausted its token budget. Audio is retained. Retry when ready.')\n\n        stop_check()\n        gen_time"),
+    ("        for token, _ in generate_step(\n            prompt=prompt_ids,", "        for token, _ in generate_step(\n            stop_check=stop_check,\n            prompt=prompt_ids,"),
+]
+REPLACEMENTS["mlx_audio/lm/generate.py"] = [
+    ("    input_embeddings: Optional[mx.array] = None,\n) -> Generator[Tuple", "    input_embeddings: Optional[mx.array] = None,\n    stop_check=None,\n) -> Generator[Tuple"),
+    ("    def model_call(input_tokens, embeddings=None):\n", "    stop_check = stop_check or (lambda: None)\n    stop_check()\n\n    def model_call(input_tokens, embeddings=None):\n        stop_check()\n"),
+    ("    while count != max_tokens:\n        next_token", "    while count != max_tokens:\n        stop_check()\n        next_token"),
+]
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -140,7 +197,8 @@ def apply(root, backup, rollback=False, check=False):
     # Validate an entire staged package before replacing any installed source.
     with tempfile.TemporaryDirectory(prefix="omlx-usage-") as temporary:
         stage = Path(temporary)
-        shutil.copytree(root / "omlx", stage / "omlx", ignore=shutil.ignore_patterns("__pycache__"))
+        for package in ("omlx", "mlx_audio"):
+            shutil.copytree(root / package, stage / package, ignore=shutil.ignore_patterns("__pycache__"))
         for name, content in targets.items():
             (stage / name).write_bytes(content)
         if not rollback:

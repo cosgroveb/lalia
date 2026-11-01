@@ -35,7 +35,7 @@ import SwiftUI
         let client = OMLXClient(configuration: .success(configuration))
         if session {
             let input = try SessionAudioPreparer().prepare(session: record.id, store: store)
-            var attempt = SessionAnalysis.Attempt(profile: try client.sessionProfile())
+            var attempt = SessionAnalysis.Attempt(profile: try client.sessionProfile().bounded(duration: input.duration))
             if input.silence { print("No speech recognized."); return }
             try await client.prepareSession(profile: attempt.profile)
             attempt.rawResponse = try await client.transcribeSession(store.file(record.id, input.filename), profile: attempt.profile)

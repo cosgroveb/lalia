@@ -129,26 +129,25 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
         let boundary = "Lalia-\(UUID().uuidString)"
         let body = try Self.multipart(file: file, configuration: config, boundary: boundary,
                                       maximumBytes: profile.maximumUploadBytes, maximumTokens: profile.maximumTokens,
-                                      prompt: profile.prompt)
+                                      prompt: profile.prompt, timeout: profile.timeout)
         defer { try? FileManager.default.removeItem(at: body) }
-        var request = URLRequest(url: try config.endpoint("audio/transcriptions"), timeoutInterval: profile.timeout)
+        var request = URLRequest(url: try config.endpoint("audio/transcriptions"), timeoutInterval: profile.timeout + 5)
         request.httpMethod = "POST"
         request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
         let settings = session.configuration
-        settings.timeoutIntervalForRequest = profile.timeout
-        settings.timeoutIntervalForResource = profile.timeout
+        settings.timeoutIntervalForRequest = profile.timeout + 5
+        settings.timeoutIntervalForResource = profile.timeout + 5
         let session = URLSession(configuration: settings, delegate: LocalRequests(), delegateQueue: nil)
         defer { session.invalidateAndCancel() }
         let (data, response) = try await session.upload(for: request, fromFile: body)
-        try check(response)
+        try check(response, data: data)
         return data
     }
 
     func transcribe(_ file: URL, duration: Double) async throws -> Transcription {
         var profile = try sessionProfile()
-        profile.maximumTokens = 8_192
         profile.maximumUploadBytes = Self.maximumUploadBytes
-        profile.timeout = 1_800
+        profile = try profile.bounded(duration: duration)
         let raw = try await transcribeSession(file, profile: profile)
         let response = try JSONDecoder().decode(Transcription.self, from: raw)
         let transcript = try SpeakerTranscript(attempt: .init(profile: profile, rawResponse: raw), duration: duration)
@@ -183,16 +182,21 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
         return notes
     }
 
-    private func check(_ response: URLResponse, purpose: String = "local service") throws {
+    private func check(_ response: URLResponse, purpose: String = "local service", data: Data? = nil) throws {
         guard let response = response as? HTTPURLResponse else { throw LaliaError("Invalid \(purpose) HTTP response.") }
         guard (200..<300).contains(response.statusCode) else {
+            if let data, let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let message = (body["detail"] as? String) ?? ((body["error"] as? [String: Any])?["message"] as? String),
+               message.hasPrefix("Transcription ") {
+                throw LaliaError(message)
+            }
             let detail = response.statusCode == 404 ? " The server may not support this API; update or configure a compatible local server." : ""
             throw LaliaError("The \(purpose) returned HTTP \(response.statusCode).\(detail) Recordings are retained. Redirects are disabled.")
         }
     }
 
     static func multipart(file: URL, configuration: OMLXConfiguration, boundary: String,
-                          maximumBytes: Int = maximumUploadBytes, maximumTokens: Int = 1024, prompt: String? = nil) throws -> URL {
+                          maximumBytes: Int = maximumUploadBytes, maximumTokens: Int = 1024, prompt: String? = nil, timeout: Double? = nil) throws -> URL {
         let size = try file.resourceValues(forKeys: [.fileSizeKey]).fileSize ?? 0
         guard size > 0, size <= maximumBytes else { throw LaliaError("Audio upload must be between 1 byte and \(maximumBytes / 1_000_000) MB.") }
         let body = FileManager.default.temporaryDirectory.appending(path: "lalia-upload-\(UUID().uuidString)")
@@ -203,6 +207,7 @@ final class LocalRequests: NSObject, URLSessionTaskDelegate, Sendable {
             let output = try FileHandle(forWritingTo: body)
             defer { try? output.close() }
             var fields = [("model", configuration.transcriptionModel), ("language", configuration.language), ("max_tokens", String(maximumTokens)), ("stream", "false")]
+            if let timeout { fields.append(("timeout_seconds", String(timeout))) }
             if let prompt { fields.append(("prompt", prompt)) }
             for (key, value) in fields {
                 try output.write(contentsOf: Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(key)\"\r\n\r\n\(value)\r\n".utf8))

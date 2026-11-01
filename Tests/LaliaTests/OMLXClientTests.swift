@@ -4,12 +4,12 @@ import Testing
 @testable import Lalia
 
 private final class HTTPFixture: URLProtocol, @unchecked Sendable {
-    struct State: Sendable { var status = 200; var body = Data(); var request: URLRequest?; var suspend = false; var stops = 0 }
+    struct State: Sendable { var status = 200; var body = Data(); var request: URLRequest?; var suspend = false; var stops = 0; var starts = 0 }
     static let state = Mutex(State())
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
-        let state = Self.state.withLock { $0.request = request; return $0 }
+        let state = Self.state.withLock { $0.request = request; $0.starts += 1; return $0 }
         if state.suspend { return }
         let response = HTTPURLResponse(url: request.url!, statusCode: state.status, httpVersion: "HTTP/1.1", headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -83,6 +83,22 @@ private final class HTTPFixture: URLProtocol, @unchecked Sendable {
             #expect(throws: Error.self) { try invalid.summaryEndpoint("models") }
         }
     }
+    @Test func durationBudgetsClampSavedProfilesWithoutChangingTheirRequest() throws {
+        var profile = SessionTranscriptionProfile()
+        profile.prompt = nil
+        let short = try profile.bounded(duration: 1.85875)
+        #expect(short.maximumTokens == 316)
+        #expect(short.timeout == 33.7175)
+        #expect(short.prompt == nil)
+        #expect(try profile.bounded(duration: 3_600).maximumTokens == 49_152)
+        #expect(try profile.bounded(duration: 3_600).timeout == 2_400)
+        profile.maximumTokens = 128; profile.timeout = 2
+        #expect(try profile.bounded(duration: 2).maximumTokens == 128)
+        #expect(try profile.bounded(duration: 2).timeout == 2)
+        for duration in [0.0, -1, .nan, .infinity, 5_401] {
+            #expect(throws: Error.self) { try profile.bounded(duration: duration) }
+        }
+    }
     @Test func sessionProfileUsesCanonicalModel() async throws {
         let ready = client(body: #"{"data":[{"id":"MOSS-Transcribe-Diarize"}]}"#)
         let profile = try ready.sessionProfile()
@@ -121,7 +137,7 @@ private final class HTTPFixture: URLProtocol, @unchecked Sendable {
         #expect(raw == Data("{malformed diagnostic".utf8))
         let request = HTTPFixture.state.withLock { $0.request }
         #expect(request?.url?.port == 9999)
-        #expect(request?.timeoutInterval == 321)
+        #expect(request?.timeoutInterval == 326)
         var invalid = profile; invalid.maximumTokens = 131_072
         #expect(throws: Error.self) { try invalid.validate() }
     }
@@ -165,6 +181,25 @@ private final class HTTPFixture: URLProtocol, @unchecked Sendable {
         } catch {
             #expect(error.localizedDescription.contains("raw output"))
             #expect(!error.localizedDescription.contains("lalia-runtime setup"))
+        }
+    }
+    @Test func reportsRuntimeBudgetAndDeadlineFailuresWithoutRetry() async throws {
+        let fixture = TemporaryStore(); let record = try savedAudio(fixture.store)
+        let file = try fixture.store.file(record.id, record.segments[0].filename)
+        for (status, body, expected) in [
+            (500, #"{"error":{"message":"Transcription exhausted its token budget. Audio is retained. Retry when ready."}}"#, "token budget"),
+            (504, #"{"detail":"Transcription exceeded its time limit. Audio is retained. Retry when ready."}"#, "time limit")
+        ] {
+            let client = client(body: body, status: status)
+            do {
+                _ = try await client.transcribe(file, duration: 1)
+                Issue.record("Runtime failure unexpectedly succeeded.")
+            } catch {
+                #expect(error.localizedDescription.contains(expected))
+                #expect(error.localizedDescription.contains("Retry when ready"))
+                #expect(FileManager.default.fileExists(atPath: file.path))
+                #expect(HTTPFixture.state.withLock { $0.starts } == 1)
+            }
         }
     }
     @Test func reportsHTTPMalformedJSONAndMissingModels() async throws {

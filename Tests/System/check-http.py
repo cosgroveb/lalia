@@ -4,6 +4,7 @@ from email.parser import BytesParser
 from email.policy import default
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import io
+import math
 import json
 from pathlib import Path
 import struct
@@ -35,15 +36,17 @@ class Handler(BaseHTTPRequestHandler):
         for part in parts.iter_parts():
             fields[part.get_param("name", header="content-disposition")] = part.get_payload(decode=True)
         assert fields["model"] == b"MOSS-Transcribe-Diarize"
-        session = fields["max_tokens"] == b"49152"
+        session = self.server.session
         assert fields["language"] == b"en"
-        assert fields["max_tokens"] == (b"49152" if session else b"8192")
+
         assert fields["stream"] == b"false"
         assert fields.get("prompt") == OFFICIAL_PROMPT.encode()
         assert len(fields["file"]) <= (250_000_000 if session else 20_000_000)
         with wave.open(io.BytesIO(fields["file"]), "rb") as audio:
             assert (audio.getframerate(), audio.getnchannels(), audio.getsampwidth()) == (16000, 1, 2)
             frames = audio.getnframes()
+        assert int(fields["max_tokens"]) == min(49152, 256 + math.ceil(32 * frames / 16000))
+        assert float(fields["timeout_seconds"]) == min(2400, 30 + 2 * frames / 16000)
         assert frames <= (5400 if session else 600) * 16000
         self.server.frames.append(frames)
         if self.server.redirect:
@@ -88,6 +91,7 @@ def main():
         server.paths = []
         server.redirect = False
         server.invalid_usage = False
+        server.session = False
         worker = executor.submit(server.serve_forever)
         try:
             with tempfile.TemporaryDirectory(prefix="lalia-http-check-") as directory:
@@ -126,6 +130,7 @@ def main():
                     for _ in range(900):
                         audio.writeframesraw(second)
                 command[1] = "--transcribe-session-file"
+                server.session = True
                 result = subprocess.run(command, capture_output=True, text=True, timeout=60)
                 assert result.returncode == 0, result.stderr
                 assert server.frames == [900 * 16000], server.frames

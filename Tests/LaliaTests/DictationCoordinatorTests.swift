@@ -413,6 +413,8 @@ import Testing
         test.coordinator.retry(saved.id); await test.coordinator.waitForOperation()
         #expect(test.transcriber.requestedProfiles.count == 1)
         #expect(test.transcriber.requestedProfiles.first?.prompt == nil)
+        #expect(test.transcriber.requestedProfiles.first?.maximumTokens == 288)
+        #expect(test.transcriber.requestedProfiles.first?.timeout == 32)
         #expect(try test.storage.store.read(saved.id).analysis?.active?.profile.prompt == nil)
     }
     @Test func sessionCancellationAndMissingModelRetainAudioAndActiveResult() async throws {

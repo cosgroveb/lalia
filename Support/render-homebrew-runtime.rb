@@ -104,6 +104,7 @@ File.write(output, <<~FORMULA)
              "--backup-dir", buildpath/"runtime-patch-backup"
       cp buildpath/"Support/runtime/lalia_runtime.py", libexec/"lalia_runtime.py"
       cp buildpath/"Support/runtime/patch-audio-usage.py", libexec/"patch-audio-usage.py"
+      cp buildpath/"Support/runtime/transcription_control.py", libexec/"transcription_control.py"
       (bin/"lalia-runtime").write <<~SH
         #!/bin/bash
         exec "\#{libexec}/bin/python" "\#{libexec}/lalia_runtime.py" "$@"
