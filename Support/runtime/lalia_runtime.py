@@ -94,6 +94,9 @@ def provision_model():
             shutil.rmtree(staged)
             raise
     else:
+        import truststore
+        # Trust the macOS keychain so TLS-inspecting proxies with MDM roots work.
+        truststore.inject_into_ssl()
         from huggingface_hub import snapshot_download
         staged = ROOT / "downloads" / f"{MODEL}-{REVISION}"
         snapshot_download(repo_id=REPO, revision=REVISION, local_dir=staged,
