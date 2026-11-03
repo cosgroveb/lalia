@@ -237,9 +237,11 @@ jobs:
           brew audit --cask --strict --online cosgroveb/tap/lalia
           brew livecheck --cask cosgroveb/tap/lalia
           brew fetch --cask cosgroveb/tap/lalia
-          brew install --cask cosgroveb/tap/lalia
-          [[ -d /Applications/Lalia.app ]]
-          spctl --assess --type execute --verbose=4 /Applications/Lalia.app
+          appdir="$RUNNER_TEMP/User Applications"
+          mkdir -p "$appdir"
+          brew install --cask --appdir="$appdir" cosgroveb/tap/lalia
+          codesign --verify --deep --strict --verbose=4 "$appdir/Lalia.app"
+          spctl --assess --type execute --verbose=4 "$appdir/Lalia.app"
           brew uninstall --cask cosgroveb/tap/lalia
 
       - name: Push Homebrew cask

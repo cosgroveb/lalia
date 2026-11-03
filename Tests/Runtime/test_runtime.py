@@ -150,6 +150,20 @@ class RuntimeSetupTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "token usage"):
             lalia_runtime.validate_inference_result(result, 1.3)
 
+    def test_tmux_restart_uses_user_launchd_context_without_tmux_environment(self):
+        with (patch.dict(lalia_runtime.os.environ, {"TMUX": "socket,1,0", "HOMEBREW_TMUX": "1"}),
+              patch.object(lalia_runtime, "provision_model"),
+              patch.object(lalia_runtime, "check", side_effect=[RuntimeError("offline"), None]),
+              patch.object(lalia_runtime, "verify_inference"),
+              patch.object(lalia_runtime, "write_config"),
+              patch.object(lalia_runtime.subprocess, "run") as run):
+            lalia_runtime.setup()
+        command = run.call_args.args[0]
+        self.assertEqual(command[:3], ["/bin/launchctl", "asuser", str(lalia_runtime.os.getuid())])
+        self.assertEqual(command[3:], ["brew", "services", "restart", "lalia-runtime"])
+        self.assertNotIn("TMUX", run.call_args.kwargs["env"])
+        self.assertNotIn("HOMEBREW_TMUX", run.call_args.kwargs["env"])
+
     def test_foreign_port_owner_does_not_restart_service(self):
         with (patch.object(lalia_runtime, "provision_model"),
               patch.object(lalia_runtime, "check", side_effect=lalia_runtime.PortConflictError("foreign")),

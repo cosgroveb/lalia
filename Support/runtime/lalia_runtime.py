@@ -282,7 +282,14 @@ def setup():
     except PortConflictError:
         raise
     except RuntimeError:
-        subprocess.run(["brew", "services", "restart", "lalia-runtime"], check=True)
+        command = ["brew", "services", "restart", "lalia-runtime"]
+        environment = os.environ.copy()
+        if "TMUX" in environment or "HOMEBREW_TMUX" in environment:
+            # Reattach to the user bootstrap namespace before invoking Homebrew.
+            command = ["/bin/launchctl", "asuser", str(os.getuid()), *command]
+            environment.pop("TMUX", None)
+            environment.pop("HOMEBREW_TMUX", None)
+        subprocess.run(command, env=environment, check=True)
         last_error = None
         ready = False
         for _ in range(60):
