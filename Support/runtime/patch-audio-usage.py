@@ -85,12 +85,19 @@ REPLACEMENTS["omlx/engine/stt.py"] += [
      "            control.limit_duration(len(audio) / sample_rate)\n"
      "            gen_kwargs['max_tokens'] = control.max_tokens\n"
      "            gen_kwargs['stop_check'] = control.check\n"
+     "            gen_kwargs['generation_state'] = control.generation_state\n"
      "            result = model.generate(audio, **gen_kwargs)\n"
      "            control.check()"),
     ('                "duration": 0.0,\n            }\n\n        activity_id = self._begin_activity(\n            "transcribing",',
      '                "duration": 0.0,\n            }\n\n'
      "        def _guarded_sync():\n"
      "            try:\n                control.check()\n                return _transcribe_sync()\n"
+     "            except Exception as error:\n"
+     "                state = control.generation_state\n"
+     "                if state:\n"
+     "                    control.record_failure(audio_path, self._model_name, state['token_ids'],\n"
+     "                                           state['tokenizer'], state.get('stop_reason', 'error'), error)\n"
+     "                raise\n"
      "            finally:\n"
      "                from mlx_audio.lm.generate import generation_stream\n"
      "                mx.synchronize(generation_stream)\n"
@@ -106,10 +113,19 @@ REPLACEMENTS["omlx/engine/stt.py"].append((
     "            self._end_activity(activity_id)\n\n    def supports_native_stt_streaming",
 ))
 REPLACEMENTS["mlx_audio/stt/models/moss_transcribe_diarize/moss_transcribe_diarize.py"] = [
-    ("        hotwords: Optional[List[str]] = None,\n        **kwargs,", "        hotwords: Optional[List[str]] = None,\n        stop_check=None,\n        **kwargs,"),
+    ("        hotwords: Optional[List[str]] = None,\n        **kwargs,", "        hotwords: Optional[List[str]] = None,\n        stop_check=None,\n        generation_state=None,\n        **kwargs,"),
     ("        start_time = time.time()\n        prefill_start = time.time()", "        stop_check = stop_check or (lambda: None)\n        stop_check()\n        start_time = time.time()\n        prefill_start = time.time()"),
     ("        prefill_time = time.time() - prefill_start\n        eos_token_ids", "        stop_check()\n        prefill_time = time.time() - prefill_start\n        eos_token_ids"),
-    ("            generated_tokens.append(int(token))\n\n        gen_time", "            generated_tokens.append(int(token))\n        else:\n            raise RuntimeError('Transcription exhausted its token budget. Audio is retained. Retry when ready.')\n\n        stop_check()\n        gen_time"),
+    ("        generated_tokens = []\n",
+     "        generated_tokens = []\n"
+     "        if generation_state is not None:\n"
+     "            # Keep the live token list through response preparation.\n"
+     "            generation_state.update(token_ids=generated_tokens, tokenizer=self._tokenizer)\n"),
+    ("            generated_tokens.append(int(token))\n\n        gen_time",
+     "            generated_tokens.append(int(token))\n        else:\n"
+     "            if generation_state is not None:\n                generation_state['stop_reason'] = 'token_limit'\n"
+     "            raise RuntimeError('Transcription exhausted its token budget. Audio is retained. Retry when ready.')\n\n"
+     "        stop_check()\n        gen_time"),
     ("        for token, _ in generate_step(\n            prompt=prompt_ids,", "        for token, _ in generate_step(\n            stop_check=stop_check,\n            prompt=prompt_ids,"),
 ]
 REPLACEMENTS["mlx_audio/lm/generate.py"] = [

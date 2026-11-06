@@ -52,6 +52,11 @@ Keyboard interruptions leave sessions running and shortcuts recover on their own
 A warning beside the menu-bar icon identifies unavailable shortcuts. Use menu
 `Stop Transcribing` if the shortcut is unavailable.
 
+Failed model generation saves owner-only diagnostic JSON under
+`~/.local/share/lalia/runtime/diagnostics/`, including partial text, token IDs,
+the stopping reason, and the audio file's SHA-256. The transcription remains
+failed. These files are separate from History and remain until manually deleted.
+
 ## Configuration
 
 Lalia reads `~/.config/lalia/config.json`. New installations use:

@@ -1,10 +1,15 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import hashlib
+import json
 from pathlib import Path
+import tempfile
 import threading
 import time
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location("control", Path(__file__).parents[2] / "Support/runtime/transcription_control.py")
 control = importlib.util.module_from_spec(SPEC)
@@ -31,6 +36,65 @@ class BudgetTests(unittest.TestCase):
         cancelled.cancelled.set()
         with self.assertRaisesRegex(RuntimeError, "cancelled"):
             cancelled.check()
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_failed_generation_preserves_text_tokens_reason_and_audio_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.wav"
+            audio.write_bytes(b"audio fixture")
+            tokenizer = SimpleNamespace(decode=lambda tokens, **kwargs: "[0.00][S01] hello")
+            for reason in ("token_limit", "timeout", "cancelled"):
+                with self.subTest(reason=reason), patch("pathlib.Path.home", return_value=root):
+                    guard = control.TranscriptionControl(2)
+                    if reason == "timeout":
+                        guard.deadline = 0
+                    elif reason == "cancelled":
+                        guard.cancelled.set()
+                    try:
+                        guard.check()
+                    except (RuntimeError, TimeoutError):
+                        pass
+                    saved = guard.record_failure(audio, "MOSS", [10, 20], tokenizer,
+                                                 "token_limit" if reason == "token_limit" else "error",
+                                                 RuntimeError("Transcription stopped."))
+                    diagnostic = json.loads(saved.read_text())
+                    self.assertEqual(diagnostic["stop_reason"], reason)
+                    self.assertEqual(diagnostic["text"], "[0.00][S01] hello")
+                    self.assertEqual(diagnostic["token_ids"], [10, 20])
+                    self.assertEqual(diagnostic["output_tokens"], 2)
+                    self.assertEqual(diagnostic["audio_sha256"], hashlib.sha256(b"audio fixture").hexdigest())
+                    self.assertEqual(diagnostic["model"], "MOSS")
+                    self.assertEqual(diagnostic["duration_seconds"], 2)
+                    self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+                    self.assertEqual(saved.parent.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(len(list(root.rglob("*.json"))), 3)
+
+    def test_tokenizer_failure_still_preserves_token_ids(self):
+        def fail_decode(*args, **kwargs):
+            raise ValueError("Cannot decode")
+        with tempfile.TemporaryDirectory() as directory, patch("pathlib.Path.home", return_value=Path(directory)):
+            audio = Path(directory) / "audio.wav"
+            audio.write_bytes(b"audio")
+            saved = control.TranscriptionControl(2).record_failure(
+                audio, "MOSS", [10], SimpleNamespace(decode=fail_decode), "error", RuntimeError("Failed"))
+            diagnostic = json.loads(saved.read_text())
+            self.assertEqual(diagnostic["token_ids"], [10])
+            self.assertIsNone(diagnostic["text"])
+            self.assertEqual(diagnostic["decode_error"], "Cannot decode")
+
+    def test_diagnostic_write_failure_is_reported_without_replacing_generation_error(self):
+        with tempfile.TemporaryDirectory() as directory, patch("pathlib.Path.home", return_value=Path(directory)):
+            (Path(directory) / ".local").write_text("not a directory")
+            audio = Path(directory) / "audio.wav"
+            audio.write_bytes(b"audio")
+            with self.assertLogs("control", level="ERROR") as logs:
+                saved = control.TranscriptionControl(2).record_failure(
+                    audio, "MOSS", [],
+                    SimpleNamespace(decode=lambda *args, **kwargs: ""), "error", RuntimeError("Failed"))
+            self.assertIsNone(saved)
+            self.assertIn("Could not save transcription diagnostic", logs.output[0])
 
 
 class WorkerTests(unittest.IsolatedAsyncioTestCase):
